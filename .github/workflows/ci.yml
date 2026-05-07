@@ -1,0 +1,274 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        ruby: ["3.4", "4.0"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Print host info
+        run: |
+          uname -a
+          ruby -v || true
+          echo "runner.os=${{ runner.os }}"
+          echo "runner.arch=${{ runner.arch }}"
+          echo "matrix.ruby=${{ matrix.ruby }}"
+
+      - name: Install system packages on Ubuntu
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvips-dev libvips-tools
+          if [ "${{ runner.arch }}" = "X64" ]; then
+            sudo apt-get install -y nasm
+          fi
+
+      - name: Install system packages on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install vips
+          if [ "${{ runner.arch }}" = "X64" ]; then
+            brew install nasm
+          fi
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+
+      - name: Compile extension
+        run: bundle exec rake clean compile
+
+      - name: Run tests
+        run: bundle exec rake test
+
+      - name: Run existing solutions benchmark smoke
+        run: IPS_WARMUP=0.1 IPS_TIME=0.3 bundle exec ruby benchmark/compare_existing.rb
+
+  linux-native-samples:
+    name: linux native sample (${{ matrix.sample_name }})
+    runs-on: ubuntu-latest
+    needs: test
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sample_name: jpeg_turbo_compress_hot_path
+            sample_file: samples/jpeg_turbo_compress_hot_path.rb
+
+          - sample_name: mozjpeg_compress_hot_path
+            sample_file: samples/mozjpeg_compress_hot_path.rb
+
+          - sample_name: ssim_guarded_compress_hot_path
+            sample_file: samples/ssim_guarded_compress_hot_path.rb
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux profiling packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils \
+            linux-tools-common \
+            linux-tools-generic \
+            libvips-dev \
+            libvips-tools
+
+          sudo apt-get install -y "linux-tools-$(uname -r)" || true
+
+          if [ "${{ runner.arch }}" = "X64" ]; then
+            sudo apt-get install -y nasm
+          fi
+
+          sudo sysctl -w kernel.perf_event_paranoid=1 || true
+          sudo sysctl -w kernel.kptr_restrict=0 || true
+
+          perf --version || true
+          cat /proc/sys/kernel/perf_event_paranoid || true
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      - name: Compile extension
+        run: bundle exec rake clean compile
+
+      - name: Generate sample JPEG fixture
+        run: |
+          set -euo pipefail
+
+          mkdir -p tmp
+
+          bundle exec ruby - <<'RUBY'
+            require "image_pack"
+
+            width = 768
+            height = 512
+
+            pixels = String.new(capacity: width * height * 3, encoding: Encoding::BINARY)
+
+            height.times do |y|
+              width.times do |x|
+                r = x * 255 / [width - 1, 1].max
+                g = y * 255 / [height - 1, 1].max
+                b = (x ^ y) & 0xff
+
+                pixels << r << g << b
+              end
+            end
+
+            jpeg = ImagePack.compress_pixels(
+              pixels,
+              width: width,
+              height: height,
+              channels: 3,
+              algo: :jpeg_turbo,
+              quality: 95
+            )
+
+            File.binwrite("tmp/cosmos.jpeg", jpeg)
+
+            info = ImagePack.inspect_image(jpeg)
+            puts "generated tmp/cosmos.jpeg: #{info.inspect}, bytes=#{jpeg.bytesize}"
+          RUBY
+
+      - name: Run Linux perf capture
+        run: |
+          set -euo pipefail
+
+          mkdir -p samples/results
+
+          SAMPLE_NAME="${{ matrix.sample_name }}"
+          SAMPLE_SCRIPT="${{ matrix.sample_file }}"
+
+          PERF_DATA="/tmp/image_pack_${SAMPLE_NAME}.perf.data"
+          OUT="samples/results/image_pack_${SAMPLE_NAME}_linux_perf.txt"
+          LOG="/tmp/image_pack_${SAMPLE_NAME}.run.log"
+
+          echo "sample_name=$SAMPLE_NAME"
+          echo "sample_script=$SAMPLE_SCRIPT"
+          echo "perf_data=$PERF_DATA"
+          echo "out=$OUT"
+
+          DURATION=18 \
+          SLEEP_BEFORE_HOT_LOOP=3 \
+          PREHEAT_ITERATIONS=1 \
+            bundle exec ruby "$SAMPLE_SCRIPT" tmp/cosmos.jpeg > "$LOG" 2>&1 &
+
+          HOT_PID="$!"
+
+          echo "perf target pid=$HOT_PID"
+
+          sleep 1
+
+          if ! kill -0 "$HOT_PID" 2>/dev/null; then
+            echo "sample script exited before perf attach"
+            cat "$LOG"
+            exit 1
+          fi
+
+          {
+            echo "===== sample script log ====="
+            cat "$LOG"
+            echo
+
+            echo "===== host info ====="
+            uname -a
+            ruby -v
+            perf --version || true
+            echo "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid || true)"
+            echo
+
+            echo "===== perf record ====="
+          } | tee "$OUT"
+
+          sudo perf record \
+            -e cpu-clock \
+            -F 997 \
+            -g \
+            --call-graph dwarf \
+            -p "$HOT_PID" \
+            -o "$PERF_DATA" \
+            -- sleep 16 \
+            2>&1 | tee -a "$OUT"
+
+          {
+            echo
+            echo "===== perf report focused native symbols ====="
+            sudo perf report \
+              --stdio \
+              -i "$PERF_DATA" \
+              --no-children \
+              2>/dev/null \
+              | grep -E "ImagePack|image_pack|ip_|guarded|ssim|jpeg_|jinit_|jcopy_|jzero_|jsimd_|huff|dct|jcap|jdat|jdap|jdcoef|jccoef|jchuff|jdhuff|jfdct|jidct|jmem|jutils|progression|optimize" \
+              | head -320 || true
+
+            echo
+            echo "===== perf report head -320 ====="
+            sudo perf report \
+              --stdio \
+              -i "$PERF_DATA" \
+              --no-children \
+              2>/dev/null \
+              | head -320 || true
+          } | tee -a "$OUT"
+
+          wait "$HOT_PID"
+
+      - name: Verify expected native symbols
+        run: |
+          set -euo pipefail
+
+          OUT="samples/results/image_pack_${{ matrix.sample_name }}_linux_perf.txt"
+          SAMPLE_NAME="${{ matrix.sample_name }}"
+
+          echo "checking $OUT"
+
+          grep -E "ip_compress_jpeg_entry" "$OUT"
+          grep -E "rb_nogvl|ip_run_encode_nogvl" "$OUT"
+          grep -E "encode_pixels_with_libjpeg|jpeg_write_scanlines" "$OUT"
+
+          case "$SAMPLE_NAME" in
+            jpeg_turbo_compress_hot_path)
+              grep -E "ip_jpeg_turbo_compress|compress_jpeg_input_with_mode" "$OUT"
+              ;;
+
+            mozjpeg_compress_hot_path)
+              grep -E "ip_mozjpeg_compress|compress_jpeg_input_with_mode" "$OUT"
+              ;;
+
+            ssim_guarded_compress_hot_path)
+              grep -E "guarded_compress_jpeg_input_with_mode" "$OUT"
+              ;;
+
+            *)
+              echo "unknown sample: $SAMPLE_NAME"
+              exit 1
+              ;;
+          esac
+
+      - name: Upload Linux perf result
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-native-sample-${{ matrix.sample_name }}
+          path: samples/results/image_pack_${{ matrix.sample_name }}_linux_perf.txt

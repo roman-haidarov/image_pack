@@ -1,0 +1,58 @@
+*.gem
+*.rbc
+/.config
+/coverage/
+/InstalledFiles
+/pkg/
+/spec/reports/
+/test/tmp/
+/tmp/
+
+.byebug_history
+
+# C extension build artifacts
+*.o
+*.so
+*.bundle
+*.dylib
+Makefile
+mkmf.log
+ext/**/*.o
+ext/**/*.so
+ext/**/*.bundle
+ext/**/*.dylib
+ext/**/Makefile
+ext/**/mkmf.log
+ext/multi_compress/vendor/*
+!ext/multi_compress/vendor/.vendored
+!ext/multi_compress/vendor/brotli/
+!ext/multi_compress/vendor/lz4/
+!ext/multi_compress/vendor/zstd/
+
+# Compiled gem files
+*.gem
+
+# Bundler
+/.bundle/
+/vendor/bundle
+Gemfile.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Performance benchmarks (contains system-specific results)
+benchmark_performance.rb
+benchmark_comparison.rb
+# test
+profile_hot_paths.rb
+
+# samples
+samples/results/*
