@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.1
+
+- `ip_compute_ssim_luma_buffer`: rewrote inner accumulators from `double` to
+  `int32_t`. For an 8x8 luma window all partial sums (sum, sum-of-squares,
+  cross-product) fit in 32 bits. GCC was already auto-vectorizing the
+  `double` version on AVX2 (4 lanes × fp64), but int32 doubles the lane
+  count (8 lanes × i32) and uses cheaper integer multiplies. Split the
+  kernel into a fixed-size 8x8 specialization plus a variable edge kernel.
+  Top hot symbol in the SSIM-guarded perf profile.
+- `ip_build_luma_buffer`: split the runtime-strided BT.601 loop into
+  channels==3 and channels==4 specializations with `__restrict__` pointers
+  so the compiler can vectorize per-pixel work.
+- `prepare_encode_row` (RGBA→RGB): `__restrict__` + hoisted width to enable
+  vectorization by the compiler.
+- `ip_malloc_hot`: new helper for buffers we touch in tight loops right
+  after allocation. On Linux it issues `madvise(MADV_HUGEPAGE)` for
+  allocations >= 256 KiB to remove the per-cacheline minor page faults
+  that previously appeared inside `jsimd_*_avx2` hot loops in the perf
+  profile. No-op on macOS / non-Linux. Used for the decoded pixel buffer,
+  the SSIM luma buffer, and the pixel input buffer.
+- SSIM-guarded path: reference and candidate decodes both now use
+  `fast_decode_mode=1` (no fancy upsampling, no block smoothing). The
+  comparison stays apples-to-apples since both sides use the same decode
+  pipeline; ~30% reduction in candidate-decode cost.
+- `extconf.rb`: opt-in `IMAGE_PACK_MARCH=<arch>` env knob for tuned
+  builds (`native`, `x86-64-v3`, etc). Default build stays portable.
+  Also added `-fno-math-errno -fno-trapping-math` to remove libm-related
+  vectorization barriers without changing semantics for the integer hot
+  paths.
+- CI: Linux x86_64 jobs now compile with `IMAGE_PACK_MARCH=x86-64-v3`
+  (AVX2 baseline; covers all current GitHub-hosted runner generations).
+  arm64 / macOS unchanged.
+
 ## 0.2.0
 
 - Added `min_ssim:` to `ImagePack.compress` for SSIM-guarded JPEG compression.

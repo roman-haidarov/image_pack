@@ -186,8 +186,15 @@ def detect_simd_arch
 end
 
 def find_nasm
-  ENV["AS_NASM"].presence_or_nil ||
+  presence(ENV["AS_NASM"]) ||
     %w[nasm yasm].find { |bin| system("which #{bin} >/dev/null 2>&1") }
+end
+
+def presence(string)
+  return nil if string.nil?
+  return nil if string.empty?
+
+  string
 end
 
 def write_mozjpeg_config_headers!(build_dir, with_simd:)
@@ -350,21 +357,6 @@ def write_neon_compat_header!(mozjpeg_dir)
   target
 end
 
-class String
-  unless instance_methods.include?(:presence_or_nil)
-    def presence_or_nil
-      empty? ? nil : self
-    end
-  end
-end
-class NilClass
-  unless instance_methods.include?(:presence_or_nil)
-    def presence_or_nil
-      nil
-    end
-  end
-end
-
 def configure_vendored_mozjpeg(vendor_dir)
   versions = File.read(File.join(vendor_dir, ".vendored"))
   mozjpeg_dir = File.join(vendor_dir, "mozjpeg")
@@ -497,6 +489,14 @@ $warnflags = ""
 
 unless msvc?
   $CFLAGS += " -O3 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -std=gnu11"
+  $CFLAGS += " -fno-math-errno -fno-trapping-math"
+
+  march = ENV["IMAGE_PACK_MARCH"].to_s
+  unless march.empty?
+    $CFLAGS += " -march=#{march}"
+    $CFLAGS += " -mtune=#{march}" if march == "native"
+    puts "image_pack: using -march=#{march}"
+  end
 else
   $CFLAGS += " -O2"
 end
