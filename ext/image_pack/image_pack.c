@@ -17,6 +17,10 @@
 #include <string.h>
 #include <jpeglib.h>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+
 #ifndef IMAGE_PACK_INIT_EXPORT
 #if defined(_WIN32)
 #define IMAGE_PACK_INIT_EXPORT __declspec(dllexport)
@@ -37,6 +41,14 @@
 
 #ifndef FALSE
 #define FALSE 0
+#endif
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#define IP_RESTRICT __restrict
+#elif defined(__GNUC__) || defined(__clang__)
+#define IP_RESTRICT __restrict
+#else
+#define IP_RESTRICT
 #endif
 
 typedef enum { IP_ALGO_JPEG_TURBO = 1, IP_ALGO_MOZJPEG = 2 } ip_algo_t;
@@ -105,6 +117,7 @@ typedef struct {
     int max_width;
     int max_height;
     size_t max_output_size;
+    size_t max_input_size;
 
     ip_status_t status;
     char error_message[512];
@@ -117,6 +130,14 @@ typedef struct {
 
     unsigned char *scratch_row;
     size_t scratch_row_size;
+
+    struct {
+        int marker;
+        unsigned char *data;
+        unsigned int len;
+    } *preserved_markers;
+    size_t preserved_marker_count;
+    size_t preserved_marker_capacity;
 } ip_context_t;
 
 typedef struct {
@@ -152,6 +173,7 @@ static ID id_max_pixels;
 static ID id_max_width;
 static ID id_max_height;
 static ID id_max_output_size;
+static ID id_max_input_size;
 
 static ip_context_t *ip_context_new(void);
 static void ip_context_free(ip_context_t *ctx);
@@ -187,13 +209,11 @@ static void validate_limits_for_pixels(ip_context_t *ctx);
 
 static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, int *width,
                                     int *height, int *channels, int fast_decode_mode);
+static int ip_decode_jpeg_to_luma_buffer(ip_context_t *ctx, const unsigned char *data, size_t size,
+                                         unsigned char **luma, int *width, int *height);
 static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_size_mode);
 static int ip_jpeg_turbo_compress(ip_context_t *ctx);
 static int ip_mozjpeg_compress(ip_context_t *ctx);
-
-#if defined(IMAGE_PACK_ENABLE_LOSSLESS_TRANSCODE_FAST_PATH)
-static int ip_jpeg_transcode_coefficients(ip_context_t *ctx, int mozjpeg_size_mode);
-#endif
 
 static VALUE ip_compress_jpeg_entry(VALUE self, VALUE input, VALUE input_kind, VALUE output,
                                     VALUE output_kind, VALUE algo, VALUE quality, VALUE min_ssim,
@@ -251,6 +271,18 @@ static int ip_checked_image_size(int width, int height, int channels, size_t *ou
     return ip_checked_mul_size(pixels, (size_t)channels, out);
 }
 
+static void *ip_malloc_hot(size_t size) {
+    void *p = malloc(size);
+    if (!p)
+        return NULL;
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    if (size >= (256u * 1024u)) {
+        (void)madvise(p, size, MADV_HUGEPAGE);
+    }
+#endif
+    return p;
+}
+
 static void ip_validate_quality_or_raise(ip_context_t *ctx) {
     if (ctx->quality >= 1 && ctx->quality <= 100)
         return;
@@ -297,6 +329,7 @@ static ip_context_t *ip_context_new(void) {
     ctx->max_width = 30000;
     ctx->max_height = 30000;
     ctx->max_output_size = 256 * 1024 * 1024;
+    ctx->max_input_size = 256 * 1024 * 1024;
     atomic_init(&ctx->cancelled, 0);
     return ctx;
 }
@@ -309,6 +342,13 @@ static void ip_context_free(ip_context_t *ctx) {
     free(ctx->owned_pixel_data);
     free(ctx->output_path);
     free(ctx->scratch_row);
+
+    if (ctx->preserved_markers) {
+        for (size_t i = 0; i < ctx->preserved_marker_count; i++) {
+            free(ctx->preserved_markers[i].data);
+        }
+        free(ctx->preserved_markers);
+    }
 
     if (ctx->output_data && ctx->output_owner == IP_OUTPUT_OWNER_MALLOC) {
         free(ctx->output_data);
@@ -405,6 +445,12 @@ static int read_file_to_owned_buffer(ip_context_t *ctx, const char *path) {
     }
     rewind(fp);
 
+    if (ctx->max_input_size > 0 && (size_t)size > ctx->max_input_size) {
+        fclose(fp);
+        ip_context_set_error(ctx, IP_ERR_LIMIT, "input file exceeds max_input_size");
+        return 0;
+    }
+
     unsigned char *data = (unsigned char *)malloc((size_t)size);
     if (!data && size > 0) {
         fclose(fp);
@@ -435,6 +481,10 @@ static int ip_prepare_input_bytes(ip_context_t *ctx, VALUE input, ip_input_kind_
     if (kind == IP_INPUT_BYTES) {
         Check_Type(input, T_STRING);
         size_t len = (size_t)RSTRING_LEN(input);
+        if (ctx->max_input_size > 0 && len > ctx->max_input_size) {
+            ip_context_set_error(ctx, IP_ERR_LIMIT, "input bytes exceed max_input_size");
+            return 0;
+        }
         unsigned char *copy = (unsigned char *)malloc(len);
         if (!copy && len > 0) {
             ip_context_set_error(ctx, IP_ERR_OOM, "failed to copy binary String input");
@@ -452,6 +502,10 @@ static int ip_prepare_input_bytes(ip_context_t *ctx, VALUE input, ip_input_kind_
         VALUE str = io_buffer_to_string(input);
         StringValue(str);
         size_t len = (size_t)RSTRING_LEN(str);
+        if (ctx->max_input_size > 0 && len > ctx->max_input_size) {
+            ip_context_set_error(ctx, IP_ERR_LIMIT, "input IO::Buffer exceeds max_input_size");
+            return 0;
+        }
         unsigned char *copy = (unsigned char *)malloc(len);
         if (!copy && len > 0) {
             ip_context_set_error(ctx, IP_ERR_OOM, "failed to copy IO::Buffer input");
@@ -492,7 +546,7 @@ static int ip_prepare_pixels(ip_context_t *ctx, VALUE buffer, int width, int hei
         return 0;
     }
 
-    unsigned char *copy = (unsigned char *)malloc(expected);
+    unsigned char *copy = (unsigned char *)ip_malloc_hot(expected);
     if (!copy && expected > 0) {
         ip_context_set_error(ctx, IP_ERR_OOM, "failed to copy pixel buffer");
         return 0;
@@ -550,6 +604,52 @@ static VALUE ip_finish_output(ip_context_t *ctx, ip_output_kind_t kind) {
     return Qtrue;
 }
 
+static int ip_save_marker(ip_context_t *ctx, int marker, const unsigned char *data,
+                          unsigned int len) {
+    if (ctx->preserved_marker_count == ctx->preserved_marker_capacity) {
+        size_t new_cap =
+            ctx->preserved_marker_capacity == 0 ? 4 : ctx->preserved_marker_capacity * 2;
+        void *new_buf = realloc(ctx->preserved_markers, new_cap * sizeof(*ctx->preserved_markers));
+        if (!new_buf)
+            return 0;
+        ctx->preserved_markers = new_buf;
+        ctx->preserved_marker_capacity = new_cap;
+    }
+
+    unsigned char *copy = (unsigned char *)malloc(len);
+    if (!copy && len > 0)
+        return 0;
+    if (len > 0)
+        memcpy(copy, data, len);
+
+    ctx->preserved_markers[ctx->preserved_marker_count].marker = marker;
+    ctx->preserved_markers[ctx->preserved_marker_count].data = copy;
+    ctx->preserved_markers[ctx->preserved_marker_count].len = len;
+    ctx->preserved_marker_count++;
+    return 1;
+}
+
+static void ip_save_markers_from_decompress(ip_context_t *ctx,
+                                            struct jpeg_decompress_struct *cinfo) {
+    jpeg_saved_marker_ptr m;
+    for (m = cinfo->marker_list; m != NULL; m = m->next) {
+        if (m->marker == (JPEG_APP0 + 0))
+            continue;
+
+        if (!ip_save_marker(ctx, m->marker, m->data, m->data_length)) {
+            return;
+        }
+    }
+}
+
+static void ip_write_preserved_markers(ip_context_t *ctx, struct jpeg_compress_struct *cinfo) {
+    for (size_t i = 0; i < ctx->preserved_marker_count; i++) {
+        jpeg_write_marker(cinfo, ctx->preserved_markers[i].marker,
+                          (const JOCTET *)ctx->preserved_markers[i].data,
+                          ctx->preserved_markers[i].len);
+    }
+}
+
 static void ip_jpeg_invalid_error_exit(j_common_ptr cinfo) {
     ip_jpeg_error_mgr *err = (ip_jpeg_error_mgr *)cinfo->err;
     char buffer[JMSG_LENGTH_MAX];
@@ -598,6 +698,15 @@ static int ip_inspect_jpeg_header(ip_context_t *ctx) {
         jpeg_destroy_decompress(&cinfo);
         ctx->jmp_armed = 0;
         ip_context_set_error(ctx, IP_ERR_INVALID_IMAGE, "invalid JPEG header");
+        return 0;
+    }
+
+    if (cinfo.num_components == 4 || cinfo.jpeg_color_space == JCS_CMYK ||
+        cinfo.jpeg_color_space == JCS_YCCK) {
+        jpeg_destroy_decompress(&cinfo);
+        ctx->jmp_armed = 0;
+        ip_context_set_error(ctx, IP_ERR_UNSUPPORTED,
+                             "CMYK/YCCK JPEG input is not supported in this release");
         return 0;
     }
 
@@ -728,9 +837,11 @@ static int prepare_encode_row(ip_context_t *ctx, JDIMENSION y, JSAMPROW *row) {
             ctx->scratch_row_size = rgb_row_size;
         }
 
-        const unsigned char *src = ctx->pixel_data + ((size_t)y * (size_t)ctx->width * 4);
-        unsigned char *dst = ctx->scratch_row;
-        for (int x = 0; x < ctx->width; x++) {
+        const unsigned char *IP_RESTRICT src =
+            ctx->pixel_data + ((size_t)y * (size_t)ctx->width * 4);
+        unsigned char *IP_RESTRICT dst = ctx->scratch_row;
+        const int w = ctx->width;
+        for (int x = 0; x < w; x++) {
             dst[x * 3 + 0] = src[x * 4 + 0];
             dst[x * 3 + 1] = src[x * 4 + 1];
             dst[x * 3 + 2] = src[x * 4 + 2];
@@ -781,9 +892,12 @@ static int encode_pixels_with_libjpeg(ip_context_t *ctx, int mozjpeg_size_mode) 
 
     jpeg_start_compress(&cinfo, TRUE);
 
+    if (!ctx->strip_metadata) {
+        ip_write_preserved_markers(ctx, &cinfo);
+    }
+
     while (cinfo.next_scanline < cinfo.image_height) {
-        if (ctx->cancellable_requested && (cinfo.next_scanline % 16 == 0) &&
-            atomic_load(&ctx->cancelled)) {
+        if (ctx->cancellable_requested && atomic_load(&ctx->cancelled)) {
             ip_context_set_error(ctx, IP_ERR_CANCELLED, "JPEG encode cancelled");
             jpeg_abort_compress(&cinfo);
             jpeg_destroy_compress(&cinfo);
@@ -792,16 +906,32 @@ static int encode_pixels_with_libjpeg(ip_context_t *ctx, int mozjpeg_size_mode) 
             return 0;
         }
 
-        JSAMPROW row = NULL;
-        if (!prepare_encode_row(ctx, cinfo.next_scanline, &row)) {
-            jpeg_abort_compress(&cinfo);
-            jpeg_destroy_compress(&cinfo);
-            free(jpeg_buf);
-            ctx->jmp_armed = 0;
-            return 0;
+        if (ctx->channels == 4) {
+            JSAMPROW row = NULL;
+            if (!prepare_encode_row(ctx, cinfo.next_scanline, &row)) {
+                jpeg_abort_compress(&cinfo);
+                jpeg_destroy_compress(&cinfo);
+                free(jpeg_buf);
+                ctx->jmp_armed = 0;
+                return 0;
+            }
+
+            jpeg_write_scanlines(&cinfo, &row, 1);
+            continue;
         }
 
-        jpeg_write_scanlines(&cinfo, &row, 1);
+        JSAMPROW rows[16];
+        JDIMENSION batch = cinfo.image_height - cinfo.next_scanline;
+        if (batch > 16)
+            batch = 16;
+
+        for (JDIMENSION i = 0; i < batch; i++) {
+            JDIMENSION y = cinfo.next_scanline + i;
+            rows[i] = (JSAMPROW)(ctx->pixel_data +
+                                 ((size_t)y * (size_t)ctx->width * (size_t)ctx->channels));
+        }
+
+        jpeg_write_scanlines(&cinfo, rows, batch);
     }
 
     jpeg_finish_compress(&cinfo);
@@ -843,6 +973,14 @@ static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, i
 
     jpeg_create_decompress(&cinfo);
     jpeg_mem_src(&cinfo, ctx->input_data, (unsigned long)ctx->input_size);
+
+    if (!ctx->strip_metadata) {
+        jpeg_save_markers(&cinfo, JPEG_COM, 0xFFFF);
+        for (int app = 1; app < 16; app++) {
+            jpeg_save_markers(&cinfo, JPEG_APP0 + app, 0xFFFF);
+        }
+    }
+
     int rc = jpeg_read_header(&cinfo, TRUE);
     if (rc != JPEG_HEADER_OK) {
         jpeg_destroy_decompress(&cinfo);
@@ -855,6 +993,15 @@ static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, i
         jpeg_destroy_decompress(&cinfo);
         ctx->jmp_armed = 0;
         ip_context_set_error(ctx, IP_ERR_LIMIT, "JPEG dimensions exceed native int range");
+        return 0;
+    }
+
+    if (cinfo.num_components == 4 || cinfo.jpeg_color_space == JCS_CMYK ||
+        cinfo.jpeg_color_space == JCS_YCCK) {
+        jpeg_destroy_decompress(&cinfo);
+        ctx->jmp_armed = 0;
+        ip_context_set_error(ctx, IP_ERR_UNSUPPORTED,
+                             "CMYK/YCCK JPEG input is not supported in this release");
         return 0;
     }
 
@@ -892,6 +1039,11 @@ static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, i
     }
 
     jpeg_start_decompress(&cinfo);
+
+    if (!ctx->strip_metadata && !fast_decode_mode) {
+        ip_save_markers_from_decompress(ctx, &cinfo);
+    }
+
     size_t row_stride = 0;
     size_t size = 0;
     if (!ip_checked_mul_size((size_t)cinfo.output_width, (size_t)cinfo.output_components,
@@ -902,7 +1054,7 @@ static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, i
         ip_context_set_error(ctx, IP_ERR_LIMIT, "decoded image buffer size overflow");
         return 0;
     }
-    unsigned char *buf = (unsigned char *)malloc(size);
+    unsigned char *buf = (unsigned char *)ip_malloc_hot(size);
     if (!buf && size > 0) {
         jpeg_destroy_decompress(&cinfo);
         ctx->jmp_armed = 0;
@@ -911,8 +1063,16 @@ static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, i
     }
 
     while (cinfo.output_scanline < cinfo.output_height) {
-        JSAMPROW row = buf + ((size_t)cinfo.output_scanline * row_stride);
-        jpeg_read_scanlines(&cinfo, &row, 1);
+        JSAMPROW rows[16];
+        JDIMENSION batch = cinfo.output_height - cinfo.output_scanline;
+        if (batch > 16)
+            batch = 16;
+
+        for (JDIMENSION i = 0; i < batch; i++) {
+            rows[i] = buf + ((size_t)(cinfo.output_scanline + i) * row_stride);
+        }
+
+        jpeg_read_scanlines(&cinfo, rows, batch);
     }
 
     int out_width = (int)cinfo.output_width;
@@ -965,29 +1125,183 @@ static void ip_clear_output_buffer(ip_context_t *ctx) {
     ctx->output_owner = IP_OUTPUT_OWNER_NONE;
 }
 
-static int ip_decode_jpeg_buffer_preserving_context(ip_context_t *ctx, const unsigned char *data,
-                                                    size_t size, unsigned char **pixels, int *width,
-                                                    int *height, int *channels) {
-    const unsigned char *old_input_data = ctx->input_data;
-    size_t old_input_size = ctx->input_size;
+static int ip_decode_jpeg_to_luma_buffer(ip_context_t *ctx, const unsigned char *data, size_t size,
+                                         unsigned char **luma, int *width, int *height) {
+    struct jpeg_decompress_struct cinfo;
+    ip_jpeg_error_mgr jerr;
+    memset(&cinfo, 0, sizeof(cinfo));
+    memset(&jerr, 0, sizeof(jerr));
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = ip_jpeg_invalid_error_exit;
+    jerr.ctx = ctx;
+
+    ctx->jmp_armed = 1;
+    if (setjmp(ctx->jmpbuf)) {
+        ctx->jmp_armed = 0;
+        jpeg_destroy_decompress(&cinfo);
+        if (ctx->status == IP_OK)
+            ip_context_set_error(ctx, IP_ERR_INVALID_IMAGE, "JPEG luma decode failed");
+        return 0;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, data, (unsigned long)size);
+
+    int rc = jpeg_read_header(&cinfo, TRUE);
+    if (rc != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        ctx->jmp_armed = 0;
+        ip_context_set_error(ctx, IP_ERR_INVALID_IMAGE, "invalid JPEG header");
+        return 0;
+    }
+
+    if (cinfo.image_width > (JDIMENSION)INT_MAX || cinfo.image_height > (JDIMENSION)INT_MAX) {
+        jpeg_destroy_decompress(&cinfo);
+        ctx->jmp_armed = 0;
+        ip_context_set_error(ctx, IP_ERR_LIMIT, "JPEG dimensions exceed native int range");
+        return 0;
+    }
+
+    if (cinfo.num_components == 4 || cinfo.jpeg_color_space == JCS_CMYK ||
+        cinfo.jpeg_color_space == JCS_YCCK) {
+        jpeg_destroy_decompress(&cinfo);
+        ctx->jmp_armed = 0;
+        ip_context_set_error(ctx, IP_ERR_UNSUPPORTED,
+                             "CMYK/YCCK JPEG input is not supported in this release");
+        return 0;
+    }
+
+    int out_channels = cinfo.num_components == 1 ? 1 : 3;
     int old_width = ctx->width;
     int old_height = ctx->height;
     int old_channels = ctx->channels;
-    int old_bit_depth = ctx->bit_depth;
     size_t old_decoded_bytes = ctx->decoded_bytes;
 
-    ctx->input_data = data;
-    ctx->input_size = size;
-    int ok = ip_jpeg_decode_to_pixels(ctx, pixels, width, height, channels, 0);
-
-    ctx->input_data = old_input_data;
-    ctx->input_size = old_input_size;
+    ctx->width = (int)cinfo.image_width;
+    ctx->height = (int)cinfo.image_height;
+    ctx->channels = 1;
+    if (!ip_checked_image_size(ctx->width, ctx->height, 1, &ctx->decoded_bytes)) {
+        ctx->width = old_width;
+        ctx->height = old_height;
+        ctx->channels = old_channels;
+        ctx->decoded_bytes = old_decoded_bytes;
+        jpeg_destroy_decompress(&cinfo);
+        ctx->jmp_armed = 0;
+        ip_context_set_error(ctx, IP_ERR_LIMIT, "decoded luma buffer size overflows native size");
+        return 0;
+    }
+    validate_limits_for_pixels(ctx);
     ctx->width = old_width;
     ctx->height = old_height;
     ctx->channels = old_channels;
-    ctx->bit_depth = old_bit_depth;
+    size_t luma_size = ctx->decoded_bytes;
     ctx->decoded_bytes = old_decoded_bytes;
-    return ok;
+
+    if (ctx->status != IP_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        ctx->jmp_armed = 0;
+        return 0;
+    }
+
+    cinfo.out_color_space = out_channels == 1 ? JCS_GRAYSCALE : JCS_RGB;
+#if defined(IMAGE_PACK_HAS_SIMD)
+    cinfo.dct_method = JDCT_ISLOW;
+#else
+    cinfo.dct_method = JDCT_FASTEST;
+#endif
+    cinfo.do_fancy_upsampling = FALSE;
+    cinfo.do_block_smoothing = FALSE;
+    cinfo.quantize_colors = FALSE;
+    cinfo.two_pass_quantize = FALSE;
+    cinfo.dither_mode = JDITHER_NONE;
+
+    jpeg_start_decompress(&cinfo);
+
+    size_t luma_stride = (size_t)cinfo.output_width;
+    size_t row_stride = 0;
+    if (!ip_checked_mul_size((size_t)cinfo.output_width, (size_t)cinfo.output_components,
+                             &row_stride) ||
+        luma_stride == 0 || luma_size != luma_stride * (size_t)cinfo.output_height) {
+        jpeg_destroy_decompress(&cinfo);
+        ctx->jmp_armed = 0;
+        ip_context_set_error(ctx, IP_ERR_LIMIT, "decoded luma buffer size mismatch");
+        return 0;
+    }
+
+    unsigned char *buf = (unsigned char *)ip_malloc_hot(luma_size);
+    if (!buf && luma_size > 0) {
+        jpeg_destroy_decompress(&cinfo);
+        ctx->jmp_armed = 0;
+        ip_context_set_error(ctx, IP_ERR_OOM, "failed to allocate luma buffer");
+        return 0;
+    }
+
+    unsigned char *scratch = NULL;
+    if (out_channels != 1) {
+        size_t scratch_size = 0;
+        if (!ip_checked_mul_size(row_stride, 16, &scratch_size)) {
+            free(buf);
+            jpeg_destroy_decompress(&cinfo);
+            ctx->jmp_armed = 0;
+            ip_context_set_error(ctx, IP_ERR_LIMIT, "luma decode scratch size overflow");
+            return 0;
+        }
+        scratch = (unsigned char *)ip_malloc_hot(scratch_size);
+        if (!scratch) {
+            free(buf);
+            jpeg_destroy_decompress(&cinfo);
+            ctx->jmp_armed = 0;
+            ip_context_set_error(ctx, IP_ERR_OOM, "failed to allocate luma decode scratch row");
+            return 0;
+        }
+    }
+
+    while (cinfo.output_scanline < cinfo.output_height) {
+        JSAMPROW rows[16];
+        JDIMENSION start_scanline = cinfo.output_scanline;
+        JDIMENSION batch = cinfo.output_height - start_scanline;
+        if (batch > 16)
+            batch = 16;
+
+        if (out_channels == 1) {
+            for (JDIMENSION i = 0; i < batch; i++) {
+                rows[i] = buf + ((size_t)(start_scanline + i) * luma_stride);
+            }
+        } else {
+            for (JDIMENSION i = 0; i < batch; i++) {
+                rows[i] = scratch + ((size_t)i * row_stride);
+            }
+        }
+
+        JDIMENSION lines_read = jpeg_read_scanlines(&cinfo, rows, batch);
+
+        if (out_channels != 1) {
+            for (JDIMENSION y = 0; y < lines_read; y++) {
+                const unsigned char *IP_RESTRICT src = scratch + ((size_t)y * row_stride);
+                unsigned char *IP_RESTRICT dst = buf + ((size_t)(start_scanline + y) * luma_stride);
+                for (size_t x = 0; x < luma_stride; x++) {
+                    unsigned int r = src[x * 3 + 0];
+                    unsigned int g = src[x * 3 + 1];
+                    unsigned int b = src[x * 3 + 2];
+                    dst[x] = (unsigned char)((77u * r + 150u * g + 29u * b + 128u) >> 8);
+                }
+            }
+        }
+    }
+
+    int out_width = (int)cinfo.output_width;
+    int out_height = (int)cinfo.output_height;
+
+    free(scratch);
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    ctx->jmp_armed = 0;
+
+    *luma = buf;
+    *width = out_width;
+    *height = out_height;
+    return 1;
 }
 
 static unsigned char *ip_build_luma_buffer(ip_context_t *ctx, const unsigned char *pixels,
@@ -998,7 +1312,7 @@ static unsigned char *ip_build_luma_buffer(ip_context_t *ctx, const unsigned cha
         return NULL;
     }
 
-    unsigned char *luma = (unsigned char *)malloc(count);
+    unsigned char *luma = (unsigned char *)ip_malloc_hot(count);
     if (!luma) {
         ip_context_set_error(ctx, IP_ERR_OOM, "failed to allocate luma buffer");
         return NULL;
@@ -1009,83 +1323,151 @@ static unsigned char *ip_build_luma_buffer(ip_context_t *ctx, const unsigned cha
         return luma;
     }
 
-    for (size_t i = 0; i < count; i++) {
-        const unsigned char *p = pixels + (i * (size_t)channels);
-        unsigned int y =
-            77u * (unsigned int)p[0] + 150u * (unsigned int)p[1] + 29u * (unsigned int)p[2] + 128u;
-        luma[i] = (unsigned char)(y >> 8);
+    const unsigned char *IP_RESTRICT src = pixels;
+    unsigned char *IP_RESTRICT dst = luma;
+
+    if (channels == 3) {
+        for (size_t i = 0; i < count; i++) {
+            unsigned int r = src[i * 3 + 0];
+            unsigned int g = src[i * 3 + 1];
+            unsigned int b = src[i * 3 + 2];
+            dst[i] = (unsigned char)((77u * r + 150u * g + 29u * b + 128u) >> 8);
+        }
+        return luma;
     }
 
+    for (size_t i = 0; i < count; i++) {
+        unsigned int r = src[i * 4 + 0];
+        unsigned int g = src[i * 4 + 1];
+        unsigned int b = src[i * 4 + 2];
+        dst[i] = (unsigned char)((77u * r + 150u * g + 29u * b + 128u) >> 8);
+    }
     return luma;
+}
+
+static double ip_ssim_window_score_double(int32_t n, int32_t sum_a, int32_t sum_b, int32_t sum_a2,
+                                          int32_t sum_b2, int32_t sum_ab) {
+    const double c1 = 6.5025;  /* (0.01 * 255)^2 */
+    const double c2 = 58.5225; /* (0.03 * 255)^2 */
+
+    double inv_n = 1.0 / (double)n;
+    double mean_a = (double)sum_a * inv_n;
+    double mean_b = (double)sum_b * inv_n;
+    double var_a = ((double)sum_a2 * inv_n) - (mean_a * mean_a);
+    double var_b = ((double)sum_b2 * inv_n) - (mean_b * mean_b);
+    double cov_ab = ((double)sum_ab * inv_n) - (mean_a * mean_b);
+
+    if (var_a < 0.0)
+        var_a = 0.0;
+    if (var_b < 0.0)
+        var_b = 0.0;
+
+    double numerator = (2.0 * mean_a * mean_b + c1) * (2.0 * cov_ab + c2);
+    double denominator = (mean_a * mean_a + mean_b * mean_b + c1) * (var_a + var_b + c2);
+    double ssim = denominator == 0.0 ? 1.0 : numerator / denominator;
+
+    if (ssim < 0.0)
+        ssim = 0.0;
+    if (ssim > 1.0)
+        ssim = 1.0;
+    return ssim;
+}
+
+static inline double ip_ssim_window_8x8(const unsigned char *IP_RESTRICT a,
+                                        const unsigned char *IP_RESTRICT b, int width, int x0,
+                                        int y0) {
+    int32_t sum_a = 0, sum_b = 0, sum_a2 = 0, sum_b2 = 0, sum_ab = 0;
+
+    for (int y = 0; y < 8; y++) {
+        const unsigned char *pa = a + (size_t)(y0 + y) * (size_t)width + (size_t)x0;
+        const unsigned char *pb = b + (size_t)(y0 + y) * (size_t)width + (size_t)x0;
+        for (int x = 0; x < 8; x++) {
+            int32_t la = pa[x];
+            int32_t lb = pb[x];
+            sum_a += la;
+            sum_b += lb;
+            sum_a2 += la * la;
+            sum_b2 += lb * lb;
+            sum_ab += la * lb;
+        }
+    }
+
+    return ip_ssim_window_score_double(64, sum_a, sum_b, sum_a2, sum_b2, sum_ab);
+}
+
+static inline double ip_ssim_window_var(const unsigned char *IP_RESTRICT a,
+                                        const unsigned char *IP_RESTRICT b, int width, int x0,
+                                        int y0, int x1, int y1) {
+    int32_t sum_a = 0, sum_b = 0, sum_a2 = 0, sum_b2 = 0, sum_ab = 0;
+    int32_t n = 0;
+
+    for (int y = y0; y < y1; y++) {
+        const unsigned char *pa = a + (size_t)y * (size_t)width;
+        const unsigned char *pb = b + (size_t)y * (size_t)width;
+        for (int x = x0; x < x1; x++) {
+            int32_t la = pa[x];
+            int32_t lb = pb[x];
+            sum_a += la;
+            sum_b += lb;
+            sum_a2 += la * la;
+            sum_b2 += lb * lb;
+            sum_ab += la * lb;
+            n++;
+        }
+    }
+
+    if (n <= 0)
+        return 1.0;
+    return ip_ssim_window_score_double(n, sum_a, sum_b, sum_a2, sum_b2, sum_ab);
 }
 
 static double ip_compute_ssim_luma_buffer(const unsigned char *a, const unsigned char *b, int width,
                                           int height) {
     const int window = 8;
-    const double c1 = 6.5025;  /* (0.01 * 255)^2 */
-    const double c2 = 58.5225; /* (0.03 * 255)^2 */
     double total_ssim = 0.0;
     int windows = 0;
 
-    for (int y0 = 0; y0 < height; y0 += window) {
-        int y1 = y0 + window;
-        if (y1 > height)
-            y1 = height;
+    int full_x = width / window;
+    int full_y = height / window;
+    int rem_x = width - full_x * window;
+    int rem_y = height - full_y * window;
 
-        for (int x0 = 0; x0 < width; x0 += window) {
-            int x1 = x0 + window;
-            if (x1 > width)
-                x1 = width;
-
-            double sum_a = 0.0;
-            double sum_b = 0.0;
-            double sum_a2 = 0.0;
-            double sum_b2 = 0.0;
-            double sum_ab = 0.0;
-            int n = 0;
-
-            for (int y = y0; y < y1; y++) {
-                size_t row = (size_t)y * (size_t)width;
-                for (int x = x0; x < x1; x++) {
-                    size_t idx = row + (size_t)x;
-                    double la = (double)a[idx];
-                    double lb = (double)b[idx];
-                    sum_a += la;
-                    sum_b += lb;
-                    sum_a2 += la * la;
-                    sum_b2 += lb * lb;
-                    sum_ab += la * lb;
-                    n++;
-                }
-            }
-
-            if (n <= 0)
-                continue;
-
-            double inv_n = 1.0 / (double)n;
-            double mean_a = sum_a * inv_n;
-            double mean_b = sum_b * inv_n;
-            double var_a = (sum_a2 * inv_n) - (mean_a * mean_a);
-            double var_b = (sum_b2 * inv_n) - (mean_b * mean_b);
-            double cov_ab = (sum_ab * inv_n) - (mean_a * mean_b);
-
-            if (var_a < 0.0)
-                var_a = 0.0;
-            if (var_b < 0.0)
-                var_b = 0.0;
-
-            double numerator = (2.0 * mean_a * mean_b + c1) * (2.0 * cov_ab + c2);
-            double denominator = (mean_a * mean_a + mean_b * mean_b + c1) * (var_a + var_b + c2);
-            double ssim = denominator == 0.0 ? 1.0 : numerator / denominator;
-
-            if (ssim < 0.0)
-                ssim = 0.0;
-            if (ssim > 1.0)
-                ssim = 1.0;
-
-            total_ssim += ssim;
+    for (int by = 0; by < full_y; by++) {
+        int y0 = by * window;
+        for (int bx = 0; bx < full_x; bx++) {
+            int x0 = bx * window;
+            total_ssim += ip_ssim_window_8x8(a, b, width, x0, y0);
             windows++;
         }
+    }
+
+    if (rem_x > 0) {
+        int x0 = full_x * window;
+        int x1 = width;
+        for (int by = 0; by < full_y; by++) {
+            int y0 = by * window;
+            int y1 = y0 + window;
+            total_ssim += ip_ssim_window_var(a, b, width, x0, y0, x1, y1);
+            windows++;
+        }
+    }
+
+    if (rem_y > 0) {
+        int y0 = full_y * window;
+        int y1 = height;
+        for (int bx = 0; bx < full_x; bx++) {
+            int x0 = bx * window;
+            int x1 = x0 + window;
+            total_ssim += ip_ssim_window_var(a, b, width, x0, y0, x1, y1);
+            windows++;
+        }
+    }
+
+    if (rem_x > 0 && rem_y > 0) {
+        int x0 = full_x * window;
+        int y0 = full_y * window;
+        total_ssim += ip_ssim_window_var(a, b, width, x0, y0, width, height);
+        windows++;
     }
 
     return windows > 0 ? total_ssim / (double)windows : 0.0;
@@ -1104,7 +1486,7 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
         reference_channels = ctx->channels;
     } else {
         if (!ip_jpeg_decode_to_pixels(ctx, &reference_pixels, &reference_width, &reference_height,
-                                      &reference_channels, 0)) {
+                                      &reference_channels, 1)) {
             return 0;
         }
 
@@ -1120,7 +1502,7 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
 
     if (reference_channels == 4) {
         ip_context_set_error(ctx, IP_ERR_UNSUPPORTED,
-                             "min_ssim is not supported for RGBA input in v0.2.0");
+                             "min_ssim is not supported for RGBA input in v0.2.1");
         return 0;
     }
 
@@ -1163,13 +1545,12 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
         ctx->output_capacity = 0;
         ctx->output_owner = IP_OUTPUT_OWNER_NONE;
 
-        unsigned char *candidate_pixels = NULL;
+        unsigned char *candidate_luma = NULL;
         int candidate_width = 0;
         int candidate_height = 0;
-        int candidate_channels = 0;
-        int decoded_ok = ip_decode_jpeg_buffer_preserving_context(
-            ctx, candidate_jpeg, candidate_jpeg_size, &candidate_pixels, &candidate_width,
-            &candidate_height, &candidate_channels);
+        int decoded_ok =
+            ip_decode_jpeg_to_luma_buffer(ctx, candidate_jpeg, candidate_jpeg_size, &candidate_luma,
+                                          &candidate_width, &candidate_height);
 
         if (!decoded_ok) {
             free(reference_luma);
@@ -1178,25 +1559,13 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
             return 0;
         }
 
-        if (candidate_width != reference_width || candidate_height != reference_height ||
-            candidate_channels != reference_channels) {
+        if (candidate_width != reference_width || candidate_height != reference_height) {
             free(reference_luma);
-            free(candidate_pixels);
+            free(candidate_luma);
             free(candidate_jpeg);
             free(best_jpeg);
             ip_context_set_error(ctx, IP_ERR_ENCODE,
                                  "candidate JPEG dimensions differ from reference image");
-            return 0;
-        }
-
-        unsigned char *candidate_luma = ip_build_luma_buffer(ctx, candidate_pixels, candidate_width,
-                                                             candidate_height, candidate_channels);
-        free(candidate_pixels);
-
-        if (!candidate_luma) {
-            free(reference_luma);
-            free(candidate_jpeg);
-            free(best_jpeg);
             return 0;
         }
 
@@ -1243,119 +1612,6 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
     ctx->output_owner = IP_OUTPUT_OWNER_MALLOC;
     return 1;
 }
-
-#if defined(IMAGE_PACK_ENABLE_LOSSLESS_TRANSCODE_FAST_PATH)
-static int ip_jpeg_transcode_coefficients(ip_context_t *ctx, int mozjpeg_size_mode) {
-    if (mozjpeg_size_mode)
-        return 0;
-    if (!ctx->input_data || ctx->input_size < 4)
-        return 0;
-    if (ctx->input_data[0] != 0xFF || ctx->input_data[1] != 0xD8)
-        return 0;
-
-    struct jpeg_decompress_struct srcinfo;
-    struct jpeg_compress_struct dstinfo;
-    ip_jpeg_error_mgr jsrcerr;
-    ip_jpeg_error_mgr jdsterr;
-    memset(&srcinfo, 0, sizeof(srcinfo));
-    memset(&dstinfo, 0, sizeof(dstinfo));
-    memset(&jsrcerr, 0, sizeof(jsrcerr));
-    memset(&jdsterr, 0, sizeof(jdsterr));
-
-    srcinfo.err = jpeg_std_error(&jsrcerr.pub);
-    jsrcerr.pub.error_exit = ip_jpeg_invalid_error_exit;
-    jsrcerr.ctx = ctx;
-
-    dstinfo.err = jpeg_std_error(&jdsterr.pub);
-    jdsterr.pub.error_exit = ip_jpeg_encode_error_exit;
-    jdsterr.ctx = ctx;
-
-    unsigned char *jpeg_buf = NULL;
-    unsigned long jpeg_size = 0;
-    int src_created = 0;
-    int dst_created = 0;
-
-    ctx->jmp_armed = 1;
-    if (setjmp(ctx->jmpbuf)) {
-        ctx->jmp_armed = 0;
-        if (dst_created)
-            jpeg_destroy_compress(&dstinfo);
-        if (src_created)
-            jpeg_destroy_decompress(&srcinfo);
-        free(jpeg_buf);
-
-        if (ctx->status == IP_OK)
-            return 0;
-        return 0;
-    }
-
-    jpeg_create_decompress(&srcinfo);
-    src_created = 1;
-    jpeg_mem_src(&srcinfo, ctx->input_data, (unsigned long)ctx->input_size);
-
-    if (jpeg_read_header(&srcinfo, TRUE) != JPEG_HEADER_OK) {
-        jpeg_destroy_decompress(&srcinfo);
-        ctx->jmp_armed = 0;
-        return 0;
-    }
-
-    if ((int)srcinfo.image_width > ctx->max_width || (int)srcinfo.image_height > ctx->max_height ||
-        (uint64_t)srcinfo.image_width * (uint64_t)srcinfo.image_height > ctx->max_pixels) {
-        jpeg_destroy_decompress(&srcinfo);
-        ctx->jmp_armed = 0;
-        ip_context_set_error(ctx, IP_ERR_LIMIT, "image exceeds configured limits");
-        return 0;
-    }
-
-    jvirt_barray_ptr *src_coef_arrays = jpeg_read_coefficients(&srcinfo);
-    if (!src_coef_arrays) {
-        jpeg_destroy_decompress(&srcinfo);
-        ctx->jmp_armed = 0;
-        return 0;
-    }
-
-    jpeg_create_compress(&dstinfo);
-    dst_created = 1;
-    jpeg_mem_dest(&dstinfo, &jpeg_buf, &jpeg_size);
-    jpeg_copy_critical_parameters(&srcinfo, &dstinfo);
-
-    dstinfo.optimize_coding = FALSE;
-    if (ctx->progressive) {
-        jpeg_simple_progression(&dstinfo);
-        dstinfo.optimize_coding = TRUE;
-    }
-
-    jpeg_write_coefficients(&dstinfo, src_coef_arrays);
-    jpeg_finish_compress(&dstinfo);
-    jpeg_destroy_compress(&dstinfo);
-    dst_created = 0;
-
-    jpeg_finish_decompress(&srcinfo);
-    jpeg_destroy_decompress(&srcinfo);
-    src_created = 0;
-
-    ctx->jmp_armed = 0;
-
-    if ((size_t)jpeg_size > ctx->max_output_size) {
-        free(jpeg_buf);
-        ip_context_set_error(ctx, IP_ERR_LIMIT, "transcoded output exceeds max_output_size");
-        return 0;
-    }
-
-    ctx->output_data = jpeg_buf;
-    ctx->output_size = (size_t)jpeg_size;
-    ctx->output_capacity = (size_t)jpeg_size;
-    ctx->output_owner = IP_OUTPUT_OWNER_MALLOC;
-
-    if (ctx->width == 0 || ctx->height == 0) {
-        ctx->width = 0;
-        ctx->height = 0;
-        ctx->channels = 0;
-    }
-    return 1;
-}
-
-#endif
 
 static int ip_jpeg_turbo_compress(ip_context_t *ctx) {
     if (ctx->ssim_guard_enabled)
@@ -1460,6 +1716,7 @@ static void apply_configuration(VALUE self, ip_context_t *ctx) {
     ctx->max_width = config_int_value(config, id_max_width, ctx->max_width);
     ctx->max_height = config_int_value(config, id_max_height, ctx->max_height);
     ctx->max_output_size = config_size_value(config, id_max_output_size, ctx->max_output_size);
+    ctx->max_input_size = config_size_value(config, id_max_input_size, ctx->max_input_size);
 }
 
 static void validate_limits_for_pixels(ip_context_t *ctx) {
@@ -1598,6 +1855,7 @@ IMAGE_PACK_INIT_EXPORT void Init_image_pack(void) {
     id_max_width = rb_intern("max_width");
     id_max_height = rb_intern("max_height");
     id_max_output_size = rb_intern("max_output_size");
+    id_max_input_size = rb_intern("max_input_size");
 
     rb_mImagePack = rb_define_module("ImagePack");
     rb_eImagePackError = rb_const_get(rb_mImagePack, rb_intern("Error"));

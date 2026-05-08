@@ -13,7 +13,6 @@ require "pathname"
 require_relative "image_pack/version"
 require_relative "image_pack/errors"
 require_relative "image_pack/configuration"
-require_relative "image_pack/backend"
 
 begin
   require "image_pack/image_pack"
@@ -29,9 +28,11 @@ rescue LoadError
 end
 
 module ImagePack
-  ALGOS = %i[jpeg_turbo mozjpeg].freeze
+  ALGOS = %i[jpeg_turbo mozjpeg fast size].freeze
+  ALGO_TO_NATIVE = { jpeg_turbo: :jpeg_turbo, mozjpeg: :mozjpeg, fast: :jpeg_turbo, size: :mozjpeg }.freeze
   EXECUTION_MODES = %i[direct nogvl offload auto].freeze
   DEFAULT_QUALITY = 82
+  DEFAULT_ALGO = :mozjpeg
 
   class << self
     def configuration
@@ -47,7 +48,7 @@ module ImagePack
 
     def compress(input,
                  output: nil,
-                 algo: :jpeg_turbo,
+                 algo: DEFAULT_ALGO,
                  quality: nil,
                  min_ssim: nil,
                  mozjpeg_trellis: true,
@@ -72,7 +73,7 @@ module ImagePack
 
       __compress_jpeg(input, normalized_input_kind,
                       output, normalized_output_kind,
-                      algo, effective_quality.to_i,
+                      ALGO_TO_NATIVE.fetch(algo), effective_quality.to_i,
                       min_ssim ? min_ssim.to_f : 0.0,
                       mozjpeg_trellis ? 1 : 0,
                       progressive ? 1 : 0,
@@ -87,25 +88,59 @@ module ImagePack
                         height:,
                         channels:,
                         output: nil,
-                        algo: :jpeg_turbo,
+                        algo: DEFAULT_ALGO,
                         quality: DEFAULT_QUALITY,
+                        min_ssim: nil,
                         progressive: false,
+                        drop_alpha: nil,
                         execution: nil,
                         cancellable: false)
       validate_algo!(algo)
+      validate_min_ssim!(min_ssim)
       validate_quality!(quality)
       validate_dimensions!(width, height, channels)
       execution ||= configuration.execution
       validate_execution!(execution)
       validate_cancellable!(algo, execution, cancellable)
 
+      if channels.to_i == 4
+        case drop_alpha
+        when nil
+          warn "ImagePack.compress_pixels: RGBA input has its alpha channel " \
+               "discarded (JPEG cannot store alpha). Pass drop_alpha: true to " \
+               "silence this warning, or drop_alpha: false to raise instead."
+        when false
+          raise UnsupportedError,
+                "JPEG cannot store an alpha channel. Pass drop_alpha: true to drop it explicitly."
+        end
+      end
+
       normalized_output_kind = output_kind!(output)
       has_scheduler = fiber_scheduler_active?
+
+      if min_ssim
+        seed_jpeg = __compress_pixels(buffer,
+                                      width.to_i, height.to_i, channels.to_i,
+                                      nil, :return_string,
+                                      ALGO_TO_NATIVE.fetch(algo), 95,
+                                      progressive ? 1 : 0,
+                                      :direct,
+                                      0,
+                                      0)
+        return compress(seed_jpeg,
+                        output: output,
+                        algo: algo,
+                        quality: quality,
+                        min_ssim: min_ssim,
+                        progressive: progressive,
+                        execution: execution,
+                        cancellable: cancellable)
+      end
 
       __compress_pixels(buffer,
                         width.to_i, height.to_i, channels.to_i,
                         output, normalized_output_kind,
-                        algo, quality.to_i,
+                        ALGO_TO_NATIVE.fetch(algo), quality.to_i,
                         progressive ? 1 : 0,
                         execution,
                         cancellable ? 1 : 0,
@@ -123,10 +158,11 @@ module ImagePack
       when String
         if input.encoding == Encoding::BINARY || input.encoding == Encoding::ASCII_8BIT
           :bytes
-        else
-          raise InvalidArgumentError, "input path does not exist: #{input.inspect}" unless File.file?(input)
-
+        elsif input.bytesize < 4096 && !input.include?("\0") && File.file?(input)
           :path
+        else
+          input.force_encoding(Encoding::ASCII_8BIT) unless input.frozen?
+          :bytes
         end
       when Pathname
         raise InvalidArgumentError, "input path does not exist: #{input}" unless input.file?

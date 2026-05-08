@@ -8,7 +8,8 @@ module ImagePack
                   :max_pixels,
                   :max_width,
                   :max_height,
-                  :max_output_size
+                  :max_output_size,
+                  :max_input_size
 
     def initialize
       @execution              = :auto
@@ -18,6 +19,7 @@ module ImagePack
       @max_width              = 30_000
       @max_height             = 30_000
       @max_output_size        = 256 * 1024 * 1024
+      @max_input_size         = 256 * 1024 * 1024
     end
   end
 end
