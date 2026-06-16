@@ -31,6 +31,18 @@ class TestImagePackSmoke < Minitest::Test
     end
   end
 
+
+  def test_optimize_jpeg_returns_valid_jpeg_without_pixel_reencode
+    input = sample_jpeg(algo: :jpeg_turbo, quality: 90)
+
+    out = ImagePack.optimize_jpeg(input, progressive: true, strip_metadata: false, execution: :direct)
+
+    assert_jpeg out
+    info = ImagePack.inspect_image(out)
+    assert_equal DEFAULT_WIDTH, info[:width]
+    assert_equal DEFAULT_HEIGHT, info[:height]
+  end
+
   def test_inspect_image_reports_basic_metadata
     input = sample_jpeg(algo: :jpeg_turbo, quality: 82)
     info = ImagePack.inspect_image(input)

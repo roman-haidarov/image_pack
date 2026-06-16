@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.2
+
+- Fixed native cleanup safety: native contexts are now released through `rb_ensure`, including Ruby exception paths from argument coercion, config reads, native status errors, output `String` allocation, and file-output failures.
+- Fixed libjpeg `longjmp` cleanup for encode/decode/luma-decode transient buffers.
+- Fixed `max_output_size = 0` semantics; all size/dimension limits now consistently treat `0` as disabled.
+- Fixed `compress_pixels(min_ssim:)`: it now uses the raw pixel buffer as the reference instead of a temporary quality-95 seed JPEG, and it respects the requested execution mode.
+- Fixed metadata preservation drift: `strip_metadata: false` now preserves markers across fast, size, and SSIM paths.
+- Fixed EXIF Orientation stripping: when metadata is stripped, orientation is applied to decoded pixels before output.
+- Fixed `progressive:` for `algo: :mozjpeg`; `progressive: false` no longer silently inherits the max-compression progressive scan script.
+- Added decode/luma-decode cancellation checkpoints.
+- Reduced avoidable copying for explicit `execution: :direct` String/pixel inputs.
+- Batched RGBA→RGB scanline encoding instead of writing one line at a time.
+- Decoded SSIM candidate luma directly as grayscale instead of RGB + manual luma conversion.
+- Made output-path writes safer by writing to a temporary file, checking `fclose`, and renaming into place.
+- Added `compress_bytes`, `compress_file`, `optimize_jpeg`, `optimize_bytes`, `optimize_file`, and `build_info`.
+- Added coefficient-level lossless JPEG optimization through `jpeg_read_coefficients` / `jpeg_write_coefficients`; this avoids decode→pixels→re-encode when only optimizing an existing JPEG.
+- Made private native entrypoints private class methods.
+- Added `-fvisibility=hidden` and `IMAGE_PACK_REQUIRE_SIMD=1` build guard.
+
 ## 0.2.1
 
 - `ip_compute_ssim_luma_buffer`: rewrote inner accumulators from `double` to

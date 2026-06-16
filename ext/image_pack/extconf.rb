@@ -294,7 +294,11 @@ def select_simd_backend(mozjpeg_dir, arch)
 
   when :x86_64
     if find_nasm.nil?
-      warn "image_pack: x86_64 detected but NASM/YASM not found on PATH. Falling back to scalar; install nasm for ~3-4x speedup."
+      message = "image_pack: x86_64 detected but NASM/YASM not found on PATH."
+      if ENV["IMAGE_PACK_REQUIRE_SIMD"] == "1"
+        abort "#{message} Install nasm/yasm or unset IMAGE_PACK_REQUIRE_SIMD."
+      end
+      warn "#{message} Falling back to scalar; install nasm for ~3-4x speedup. Set IMAGE_PACK_REQUIRE_SIMD=1 to fail instead."
       { kind: :none }
     elsif !X86_64_C_SOURCES.all? { |rel| File.exist?(File.join(mozjpeg_dir, rel)) }
       warn "image_pack: x86_64 SIMD sources missing under #{mozjpeg_dir}/simd/x86_64/. Falling back to scalar."
@@ -489,7 +493,7 @@ $warnflags = ""
 
 unless msvc?
   $CFLAGS += " -O3 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -std=gnu11"
-  $CFLAGS += " -fno-math-errno -fno-trapping-math"
+  $CFLAGS += " -fno-math-errno -fno-trapping-math -fvisibility=hidden"
 
   march = ENV["IMAGE_PACK_MARCH"].to_s
   unless march.empty?

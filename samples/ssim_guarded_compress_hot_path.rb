@@ -109,7 +109,10 @@ puts "sample_file=#{sample_file}"
 puts "txt_file=#{txt_file}"
 puts
 puts "Copy this one-line capture command:"
-puts %(mkdir -p "#{txt_dir}"; OUT="#{txt_file}"; SAMPLE="#{sample_file}"; { sample #{Process.pid} #{sample_seconds} -f "$SAMPLE"; echo; echo "===== focused native symbols ====="; filtercalltree "$SAMPLE" | grep -E "#{native_grep}" | head -320; echo; echo "===== filtercalltree head -320 ====="; filtercalltree "$SAMPLE" | head -320; } 2>&1 | tee "$OUT")
+ssim_grep = "guarded|ssim|luma|ip_build_luma_buffer|ip_decode_jpeg_to_luma_buffer|ip_compute_ssim_luma_buffer"
+encode_grep = "encode_pixels_with_libjpeg|jpeg_write_scanlines|jpeg_finish_compress|jchuff|jfdct|quantize|jsimd_"
+decode_grep = "ip_jpeg_decode_to_pixels|jpeg_read_header|jpeg_start_decompress|jpeg_read_scanlines|jpeg_finish_decompress|jdhuff|jidct|jdcoef|jsimd_"
+puts %(mkdir -p "#{txt_dir}"; OUT="#{txt_file}"; SAMPLE="#{sample_file}"; { sample #{Process.pid} #{sample_seconds} -f "$SAMPLE"; echo; echo "===== SSIM/luma focused symbols ====="; filtercalltree "$SAMPLE" | grep -E "#{ssim_grep}" | head -220; echo; echo "===== encode focused symbols ====="; filtercalltree "$SAMPLE" | grep -E "#{encode_grep}" | head -220; echo; echo "===== decode focused symbols ====="; filtercalltree "$SAMPLE" | grep -E "#{decode_grep}" | head -220; echo; echo "===== broad native symbols ====="; filtercalltree "$SAMPLE" | grep -E "#{native_grep}" | head -320; echo; echo "===== filtercalltree head -320 ====="; filtercalltree "$SAMPLE" | head -320; } 2>&1 | tee "$OUT")
 puts
 puts "Expected hot native symbols:"
 puts "  ImagePack.compress -> __compress_jpeg"
