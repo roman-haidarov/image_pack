@@ -46,6 +46,63 @@ module ImagePack
       configuration
     end
 
+    def build_info
+      {
+        version: VERSION,
+        mozjpeg: defined?(NATIVE_MOZJPEG_VERSION) ? NATIVE_MOZJPEG_VERSION : nil,
+        simd: defined?(NATIVE_SIMD) ? NATIVE_SIMD : nil
+      }
+    end
+
+    def compress_bytes(bytes, **options)
+      raise InvalidArgumentError, "bytes must be a String" unless bytes.is_a?(String)
+
+      compress(bytes.b, **options)
+    end
+
+    def compress_file(path, **options)
+      pathname = Pathname(path)
+      raise InvalidArgumentError, "input path does not exist: #{pathname}" unless pathname.file?
+
+      compress(pathname, **options)
+    end
+
+    def optimize_bytes(bytes, **options)
+      raise InvalidArgumentError, "bytes must be a String" unless bytes.is_a?(String)
+
+      optimize_jpeg(bytes.b, **options)
+    end
+
+    def optimize_file(path, **options)
+      pathname = Pathname(path)
+      raise InvalidArgumentError, "input path does not exist: #{pathname}" unless pathname.file?
+
+      optimize_jpeg(pathname, **options)
+    end
+
+    def optimize_jpeg(input,
+                      output: nil,
+                      progressive: true,
+                      strip_metadata: false,
+                      execution: nil,
+                      cancellable: false)
+      execution ||= configuration.execution
+      validate_execution!(execution)
+      validate_cancellable!(:lossless_optimize, execution, cancellable)
+
+      normalized_input_kind = input_kind!(input)
+      normalized_output_kind = output_kind!(output)
+      has_scheduler = fiber_scheduler_active?
+
+      __optimize_jpeg(input, normalized_input_kind,
+                      output, normalized_output_kind,
+                      progressive ? 1 : 0,
+                      strip_metadata ? 1 : 0,
+                      execution,
+                      cancellable ? 1 : 0,
+                      has_scheduler ? 1 : 0)
+    end
+
     def compress(input,
                  output: nil,
                  algo: DEFAULT_ALGO,
@@ -118,29 +175,15 @@ module ImagePack
       normalized_output_kind = output_kind!(output)
       has_scheduler = fiber_scheduler_active?
 
-      if min_ssim
-        seed_jpeg = __compress_pixels(buffer,
-                                      width.to_i, height.to_i, channels.to_i,
-                                      nil, :return_string,
-                                      ALGO_TO_NATIVE.fetch(algo), 95,
-                                      progressive ? 1 : 0,
-                                      :direct,
-                                      0,
-                                      0)
-        return compress(seed_jpeg,
-                        output: output,
-                        algo: algo,
-                        quality: quality,
-                        min_ssim: min_ssim,
-                        progressive: progressive,
-                        execution: execution,
-                        cancellable: cancellable)
+      if min_ssim && channels.to_i == 4
+        raise UnsupportedError, "min_ssim is not supported for RGBA input"
       end
 
       __compress_pixels(buffer,
                         width.to_i, height.to_i, channels.to_i,
                         output, normalized_output_kind,
                         ALGO_TO_NATIVE.fetch(algo), quality.to_i,
+                        min_ssim ? min_ssim.to_f : 0.0,
                         progressive ? 1 : 0,
                         execution,
                         cancellable ? 1 : 0,
@@ -161,7 +204,6 @@ module ImagePack
         elsif input.bytesize < 4096 && !input.include?("\0") && File.file?(input)
           :path
         else
-          input.force_encoding(Encoding::ASCII_8BIT) unless input.frozen?
           :bytes
         end
       when Pathname
@@ -182,7 +224,7 @@ module ImagePack
       return :return_string if output.nil?
       return :path if output.is_a?(String) || output.is_a?(Pathname)
 
-      raise InvalidArgumentError, "output must be nil, String path, or Pathname in v0.2.0"
+      raise InvalidArgumentError, "output must be nil, String path, or Pathname in v0.2.2"
     end
 
     def validate_algo!(algo)
@@ -223,14 +265,8 @@ module ImagePack
       raise InvalidArgumentError, "channels must be 1, 3 or 4" unless [1, 3, 4].include?(channels)
     end
 
-    def validate_cancellable!(algo, execution, cancellable)
+    def validate_cancellable!(_algo, execution, cancellable)
       return unless cancellable
-
-      if algo == :jpeg_turbo
-        raise InvalidArgumentError,
-              "cancellable: true is only supported with algo: :mozjpeg in v0.2.0"
-      end
-
       return unless execution == :direct
 
       raise InvalidArgumentError,
