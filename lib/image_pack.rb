@@ -90,10 +90,12 @@ module ImagePack
                       progressive: true,
                       strip_metadata: false,
                       execution: nil,
-                      cancellable: false)
+                      cancellable: false,
+                      strict: false)
       validate_boolean!(:progressive, progressive)
       validate_boolean!(:strip_metadata, strip_metadata)
       validate_boolean!(:cancellable, cancellable)
+      validate_boolean!(:strict, strict)
       execution ||= configuration.execution
       validate_execution!(execution)
       validate_execution_supported!(execution)
@@ -109,7 +111,8 @@ module ImagePack
                       strip_metadata ? 1 : 0,
                       execution,
                       cancellable ? 1 : 0,
-                      has_scheduler ? 1 : 0)
+                      has_scheduler ? 1 : 0,
+                      strict ? 1 : 0)
     end
 
     def compress(input,
@@ -121,13 +124,17 @@ module ImagePack
                  progressive: false,
                  strip_metadata: true,
                  execution: nil,
-                 cancellable: false)
+                 cancellable: false,
+                 report: false,
+                 strict: false)
       validate_algo!(algo)
       validate_min_ssim!(min_ssim)
       validate_boolean!(:mozjpeg_trellis, mozjpeg_trellis)
       validate_boolean!(:progressive, progressive)
       validate_boolean!(:strip_metadata, strip_metadata)
       validate_boolean!(:cancellable, cancellable)
+      validate_boolean!(:report, report)
+      validate_boolean!(:strict, strict)
       quality_was_given = !quality.nil?
       effective_quality = quality_was_given ? quality : DEFAULT_QUALITY
       effective_quality = 1 if min_ssim && !quality_was_given
@@ -150,7 +157,9 @@ module ImagePack
                       strip_metadata ? 1 : 0,
                       execution,
                       cancellable ? 1 : 0,
-                      has_scheduler ? 1 : 0)
+                      has_scheduler ? 1 : 0,
+                      report ? 1 : 0,
+                      strict ? 1 : 0)
     end
 
     def compress_pixels(buffer,
@@ -166,7 +175,9 @@ module ImagePack
                         drop_alpha: nil,
                         exact_size: false,
                         execution: nil,
-                        cancellable: false)
+                        cancellable: false,
+                        report: false,
+                        strict: false)
       validate_pixel_buffer!(buffer)
       validate_algo!(algo)
       validate_min_ssim!(min_ssim)
@@ -175,6 +186,8 @@ module ImagePack
       validate_drop_alpha!(drop_alpha)
       validate_boolean!(:exact_size, exact_size)
       validate_boolean!(:cancellable, cancellable)
+      validate_boolean!(:report, report)
+      validate_boolean!(:strict, strict)
       quality_was_given = !quality.nil?
       effective_quality = quality_was_given ? quality : DEFAULT_QUALITY
       effective_quality = 1 if min_ssim && !quality_was_given
@@ -214,7 +227,9 @@ module ImagePack
                         exact_size ? 1 : 0,
                         execution,
                         cancellable ? 1 : 0,
-                        has_scheduler ? 1 : 0)
+                        has_scheduler ? 1 : 0,
+                        report ? 1 : 0,
+                        strict ? 1 : 0)
     end
 
     def inspect_image(input)
@@ -251,7 +266,7 @@ module ImagePack
       return :return_string if output.nil?
       return :path if output.is_a?(String) || output.is_a?(Pathname)
 
-      raise InvalidArgumentError, "output must be nil, String path, or Pathname in v0.2.2"
+      raise InvalidArgumentError, "output must be nil, String path, or Pathname"
     end
 
     def validate_algo!(algo)
@@ -296,7 +311,7 @@ module ImagePack
       return if offload_safe?
 
       raise UnsupportedError,
-            "execution: :offload requires Ruby >= 3.4.0; use execution: :nogvl or :auto"
+            "execution: :offload is unavailable in this runtime; it requires Ruby >= 3.4.0 and IMAGE_PACK_DISABLE_OFFLOAD must not be set"
     end
 
     def validate_dimensions!(width, height, channels)

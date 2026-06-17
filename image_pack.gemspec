@@ -10,7 +10,7 @@ Gem::Specification.new do |spec|
   spec.email         = ["romnhajdarov@gmail.com"]
 
   spec.summary       = "Ruby-native pure-C JPEG runtime: MozJPEG/libjpeg"
-  spec.description   = "Single API, vendored pure-C MozJPEG/libjpeg codec, no tempfiles, " \
+  spec.description   = "Single API, vendored pure-C MozJPEG/libjpeg codec, in-memory compression and atomic file output, " \
                        "Ruby 3.1+ native JPEG execution; Ruby 3.4+ enables Fiber::Scheduler-aware offload. " \
                        "Ships vendored C sources — no system libjpeg, git, or CMake required."
   spec.homepage      = "https://github.com/roman-haidarov/image_pack"

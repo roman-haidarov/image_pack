@@ -42,7 +42,7 @@ module ImagePack
 
       if value == :offload && ImagePack.respond_to?(:offload_safe?) && !ImagePack.offload_safe?
         raise UnsupportedError,
-              "execution: :offload requires Ruby >= 3.4.0; use execution: :nogvl or :auto"
+              "execution: :offload is unavailable in this runtime; it requires Ruby >= 3.4.0 and IMAGE_PACK_DISABLE_OFFLOAD must not be set"
       end
 
       @execution = value
