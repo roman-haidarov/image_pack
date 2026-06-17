@@ -63,4 +63,43 @@ class TestJpegQuality < Minitest::Test
     assert_jpeg guarded
     assert_operator guarded.bytesize, :>, low.bytesize
   end
+  def test_pixel_min_ssim_without_quality_starts_from_lowest_quality
+    pixels = sample_pixels(width: 128, height: 96)
+
+    default_guard = ImagePack.compress_pixels(pixels,
+                                              width: 128,
+                                              height: 96,
+                                              channels: 3,
+                                              algo: :jpeg_turbo,
+                                              min_ssim: 0.10,
+                                              execution: :direct)
+    explicit_low = ImagePack.compress_pixels(pixels,
+                                             width: 128,
+                                             height: 96,
+                                             channels: 3,
+                                             algo: :jpeg_turbo,
+                                             quality: 1,
+                                             min_ssim: 0.10,
+                                             execution: :direct)
+
+    assert_jpeg default_guard
+    assert_jpeg explicit_low
+    assert_equal explicit_low.bytesize, default_guard.bytesize
+  end
+
+  def test_compress_pixels_accepts_mozjpeg_trellis_option
+    pixels = sample_pixels(width: 96, height: 80)
+
+    out = ImagePack.compress_pixels(pixels,
+                                    width: 96,
+                                    height: 80,
+                                    channels: 3,
+                                    algo: :mozjpeg,
+                                    mozjpeg_trellis: false,
+                                    quality: 82,
+                                    execution: :direct)
+
+    assert_jpeg out
+  end
+
 end

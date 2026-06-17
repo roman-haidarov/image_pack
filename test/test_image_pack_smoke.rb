@@ -52,6 +52,7 @@ class TestImagePackSmoke < Minitest::Test
     assert_equal DEFAULT_HEIGHT, info[:height]
     assert_equal DEFAULT_CHANNELS, info[:channels]
     assert_equal 8, info[:bit_depth]
+    assert_includes %i[ycbcr rgb], info[:color_space]
     assert_operator info[:decoded_bytes], :>, 0
   end
 end

@@ -1,5 +1,6 @@
 # Changelog
 
+- Lowered the runtime floor to Ruby >= 3.1.0 while keeping `execution: :offload` Ruby >= 3.4-only and explicitly unsupported on older Rubies.
 ## 0.2.2
 
 - Fixed native cleanup safety: native contexts are now released through `rb_ensure`, including Ruby exception paths from argument coercion, config reads, native status errors, output `String` allocation, and file-output failures.

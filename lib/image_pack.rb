@@ -1,12 +1,12 @@
 # frozen_string_literal: true
 
-required = Gem::Version.new("3.4.0")
+required = Gem::Version.new("3.1.0")
 current  = Gem::Version.new(RUBY_VERSION)
 
 if current < required
   raise LoadError,
-        "image_pack requires Ruby >= 3.4.0, got #{RUBY_VERSION}. " \
-        "Reason: gem relies on RB_NOGVL_OFFLOAD_SAFE / Fiber::Scheduler hooks."
+        "image_pack requires Ruby >= 3.1.0, got #{RUBY_VERSION}. " \
+        "Ruby >= 3.4.0 is required only for execution: :offload."
 end
 
 require "pathname"
@@ -50,8 +50,13 @@ module ImagePack
       {
         version: VERSION,
         mozjpeg: defined?(NATIVE_MOZJPEG_VERSION) ? NATIVE_MOZJPEG_VERSION : nil,
-        simd: defined?(NATIVE_SIMD) ? NATIVE_SIMD : nil
+        simd: defined?(NATIVE_SIMD) ? NATIVE_SIMD : nil,
+        offload_safe: offload_safe?
       }
+    end
+
+    def offload_safe?
+      defined?(NATIVE_OFFLOAD_SAFE) && NATIVE_OFFLOAD_SAFE == true
     end
 
     def compress_bytes(bytes, **options)
@@ -86,8 +91,12 @@ module ImagePack
                       strip_metadata: false,
                       execution: nil,
                       cancellable: false)
+      validate_boolean!(:progressive, progressive)
+      validate_boolean!(:strip_metadata, strip_metadata)
+      validate_boolean!(:cancellable, cancellable)
       execution ||= configuration.execution
       validate_execution!(execution)
+      validate_execution_supported!(execution)
       validate_cancellable!(:lossless_optimize, execution, cancellable)
 
       normalized_input_kind = input_kind!(input)
@@ -115,13 +124,17 @@ module ImagePack
                  cancellable: false)
       validate_algo!(algo)
       validate_min_ssim!(min_ssim)
-      validate_mozjpeg_trellis!(mozjpeg_trellis)
+      validate_boolean!(:mozjpeg_trellis, mozjpeg_trellis)
+      validate_boolean!(:progressive, progressive)
+      validate_boolean!(:strip_metadata, strip_metadata)
+      validate_boolean!(:cancellable, cancellable)
       quality_was_given = !quality.nil?
       effective_quality = quality_was_given ? quality : DEFAULT_QUALITY
       effective_quality = 1 if min_ssim && !quality_was_given
       validate_quality!(effective_quality)
       execution ||= configuration.execution
       validate_execution!(execution)
+      validate_execution_supported!(execution)
       validate_cancellable!(algo, execution, cancellable)
 
       normalized_input_kind = input_kind!(input)
@@ -130,7 +143,7 @@ module ImagePack
 
       __compress_jpeg(input, normalized_input_kind,
                       output, normalized_output_kind,
-                      ALGO_TO_NATIVE.fetch(algo), effective_quality.to_i,
+                      ALGO_TO_NATIVE.fetch(algo), effective_quality,
                       min_ssim ? min_ssim.to_f : 0.0,
                       mozjpeg_trellis ? 1 : 0,
                       progressive ? 1 : 0,
@@ -146,21 +159,33 @@ module ImagePack
                         channels:,
                         output: nil,
                         algo: DEFAULT_ALGO,
-                        quality: DEFAULT_QUALITY,
+                        quality: nil,
                         min_ssim: nil,
+                        mozjpeg_trellis: true,
                         progressive: false,
                         drop_alpha: nil,
+                        exact_size: false,
                         execution: nil,
                         cancellable: false)
+      validate_pixel_buffer!(buffer)
       validate_algo!(algo)
       validate_min_ssim!(min_ssim)
-      validate_quality!(quality)
+      validate_boolean!(:mozjpeg_trellis, mozjpeg_trellis)
+      validate_boolean!(:progressive, progressive)
+      validate_drop_alpha!(drop_alpha)
+      validate_boolean!(:exact_size, exact_size)
+      validate_boolean!(:cancellable, cancellable)
+      quality_was_given = !quality.nil?
+      effective_quality = quality_was_given ? quality : DEFAULT_QUALITY
+      effective_quality = 1 if min_ssim && !quality_was_given
+      validate_quality!(effective_quality)
       validate_dimensions!(width, height, channels)
       execution ||= configuration.execution
       validate_execution!(execution)
+      validate_execution_supported!(execution)
       validate_cancellable!(algo, execution, cancellable)
 
-      if channels.to_i == 4
+      if channels == 4
         case drop_alpha
         when nil
           warn "ImagePack.compress_pixels: RGBA input has its alpha channel " \
@@ -175,16 +200,18 @@ module ImagePack
       normalized_output_kind = output_kind!(output)
       has_scheduler = fiber_scheduler_active?
 
-      if min_ssim && channels.to_i == 4
+      if min_ssim && channels == 4
         raise UnsupportedError, "min_ssim is not supported for RGBA input"
       end
 
       __compress_pixels(buffer,
-                        width.to_i, height.to_i, channels.to_i,
+                        width, height, channels,
                         output, normalized_output_kind,
-                        ALGO_TO_NATIVE.fetch(algo), quality.to_i,
+                        ALGO_TO_NATIVE.fetch(algo), effective_quality,
                         min_ssim ? min_ssim.to_f : 0.0,
+                        mozjpeg_trellis ? 1 : 0,
                         progressive ? 1 : 0,
+                        exact_size ? 1 : 0,
                         execution,
                         cancellable ? 1 : 0,
                         has_scheduler ? 1 : 0)
@@ -246,11 +273,16 @@ module ImagePack
       raise InvalidArgumentError, "min_ssim must be Numeric > 0.0 and <= 1.0, got: #{min_ssim.inspect}"
     end
 
-
-    def validate_mozjpeg_trellis!(value)
+    def validate_boolean!(name, value)
       return if value == true || value == false
 
-      raise InvalidArgumentError, "mozjpeg_trellis must be true or false, got: #{value.inspect}"
+      raise InvalidArgumentError, "#{name} must be true or false, got: #{value.inspect}"
+    end
+
+    def validate_drop_alpha!(value)
+      return if value.nil? || value == true || value == false
+
+      raise InvalidArgumentError, "drop_alpha must be true, false, or nil, got: #{value.inspect}"
     end
 
     def validate_execution!(execution)
@@ -259,10 +291,25 @@ module ImagePack
       raise InvalidArgumentError, "execution must be one of #{EXECUTION_MODES}, got: #{execution.inspect}"
     end
 
+    def validate_execution_supported!(execution)
+      return unless execution == :offload
+      return if offload_safe?
+
+      raise UnsupportedError,
+            "execution: :offload requires Ruby >= 3.4.0; use execution: :nogvl or :auto"
+    end
+
     def validate_dimensions!(width, height, channels)
-      raise InvalidArgumentError, "width must be > 0" unless width.is_a?(Integer) && width.positive?
-      raise InvalidArgumentError, "height must be > 0" unless height.is_a?(Integer) && height.positive?
+      raise InvalidArgumentError, "width must be Integer > 0" unless width.is_a?(Integer) && width.positive?
+      raise InvalidArgumentError, "height must be Integer > 0" unless height.is_a?(Integer) && height.positive?
       raise InvalidArgumentError, "channels must be 1, 3 or 4" unless [1, 3, 4].include?(channels)
+    end
+
+    def validate_pixel_buffer!(buffer)
+      return if buffer.is_a?(String)
+      return if defined?(IO::Buffer) && buffer.is_a?(IO::Buffer)
+
+      raise InvalidArgumentError, "pixel buffer must be a String or IO::Buffer"
     end
 
     def validate_cancellable!(_algo, execution, cancellable)
@@ -274,7 +321,7 @@ module ImagePack
     end
 
     def fiber_scheduler_active?
-      Fiber.respond_to?(:scheduler) && !Fiber.scheduler.nil?
+      offload_safe? && Fiber.respond_to?(:scheduler) && !Fiber.scheduler.nil?
     end
   end
 end
