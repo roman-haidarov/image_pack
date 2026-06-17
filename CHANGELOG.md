@@ -1,6 +1,22 @@
 # Changelog
 
+## 0.2.4
+
+- libjpeg/MozJPEG diagnostics are no longer written to `stderr`; instead decode warnings (e.g. "Premature end of JPEG file") are counted and the first message is captured, so a damaged or truncated input is observable rather than silently degraded.
+- Added `strict:` to `compress`, `compress_pixels`, and `optimize_jpeg`. With `strict: true` the first libjpeg warning is promoted to `ImagePack::InvalidImageError` instead of producing a degraded JPEG; default is `false`.
+- Added `report:` to `compress` and `compress_pixels`. With `report: true` the call returns a Hash `{ output:, quality:, ssim:, algo:, bytesize:, input_bytesize:, warning_count:, warning: }`, exposing the SSIM-selected quality, achieved luma SSIM, and decode warning information; `report: false` (default) keeps the previous return value (binary `String` or `true`).
+- Made the no-GVL and offload execution paths interruptible regardless of `cancellable:`. Decode/encode/SSIM checkpoints now always observe the unblock signal, and a pending Ruby interrupt (signal, `Thread#raise`, `Thread#kill`, scheduler) is delivered via `rb_thread_check_ints` after the native section, so the raised exception propagates instead of being masked. Cancellation is expressed by raising on the worker thread; `ImagePack::CancelledError` is the idiomatic choice.
+- Added the `IMAGE_PACK_DISABLE_OFFLOAD=1` runtime opt-out. The vendored MozJPEG SIMD thread-local storage is only an idempotent CPU-feature cache, so offload remains safe with SIMD enabled, but the environment variable forces `offload_safe?` to `false` and prevents `:auto`/`:offload` from offloading.
+- `NATIVE_MOZJPEG_VERSION` is now derived from a dedicated `IMAGE_PACK_MOZJPEG_VERSION` compile define instead of relying on the libjpeg `VERSION` macro being in scope.
+- Removed the unused `IMAGE_PACK_RUBY34_ONLY` compile define.
+- Removed a stale `v0.2.2` reference from the `output:` argument error message.
+- Added tests covering `report:`, `strict:`, warning collection, the cancellation contract, offload availability, and version hygiene.
+- Documentation and message version references updated to 0.2.4.
+
+## 0.2.3
+
 - Lowered the runtime floor to Ruby >= 3.1.0 while keeping `execution: :offload` Ruby >= 3.4-only and explicitly unsupported on older Rubies.
+
 ## 0.2.2
 
 - Fixed native cleanup safety: native contexts are now released through `rb_ensure`, including Ruby exception paths from argument coercion, config reads, native status errors, output `String` allocation, and file-output failures.

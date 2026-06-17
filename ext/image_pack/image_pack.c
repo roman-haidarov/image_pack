@@ -40,6 +40,10 @@
 #define TRUE 1
 #endif
 
+#ifndef IMAGE_PACK_MOZJPEG_VERSION
+#define IMAGE_PACK_MOZJPEG_VERSION VERSION
+#endif
+
 #ifndef FALSE
 #define FALSE 0
 #endif
@@ -151,6 +155,9 @@ typedef struct {
 
     atomic_int cancelled;
     int cancellable_requested;
+    int strict;
+    int warning_count;
+    char first_warning[200];
 
     jmp_buf jmpbuf;
     int jmp_armed;
@@ -174,6 +181,7 @@ typedef struct {
 } ip_jpeg_error_mgr;
 
 static VALUE rb_mImagePack;
+static int ip_offload_runtime_enabled = 1;
 static VALUE rb_eImagePackError;
 static VALUE rb_eImagePackInvalidArgumentError;
 static VALUE rb_eImagePackInvalidImageError;
@@ -255,18 +263,20 @@ static int ip_run_optimize_context(ip_context_t *ctx);
 typedef struct {
     VALUE self, input, input_kind, output, output_kind, algo, quality, min_ssim;
     VALUE mozjpeg_trellis, progressive, strip_metadata, execution, cancellable, has_scheduler;
+    VALUE report, strict;
     ip_context_t *ctx;
 } ip_compress_jpeg_call_t;
 
 typedef struct {
     VALUE self, buffer, width, height, channels, output, output_kind, algo, quality, min_ssim;
     VALUE mozjpeg_trellis, progressive, exact_size, execution, cancellable, has_scheduler;
+    VALUE report, strict;
     ip_context_t *ctx;
 } ip_compress_pixels_call_t;
 
 typedef struct {
     VALUE self, input, input_kind, output, output_kind, progressive, strip_metadata;
-    VALUE execution, cancellable, has_scheduler;
+    VALUE execution, cancellable, has_scheduler, strict;
     ip_context_t *ctx;
 } ip_optimize_jpeg_call_t;
 
@@ -287,15 +297,13 @@ static VALUE ip_call_cleanup(VALUE ptr) {
 static VALUE ip_compress_jpeg_entry(VALUE self, VALUE input, VALUE input_kind, VALUE output,
                                     VALUE output_kind, VALUE algo, VALUE quality, VALUE min_ssim,
                                     VALUE mozjpeg_trellis, VALUE progressive, VALUE strip_metadata,
-                                    VALUE execution, VALUE cancellable, VALUE has_scheduler);
-static VALUE ip_compress_pixels_entry(VALUE self, VALUE buffer, VALUE width, VALUE height,
-                                      VALUE channels, VALUE output, VALUE output_kind, VALUE algo,
-                                      VALUE quality, VALUE min_ssim, VALUE mozjpeg_trellis,
-                                      VALUE progressive, VALUE exact_size, VALUE execution,
-                                      VALUE cancellable, VALUE has_scheduler);
+                                    VALUE execution, VALUE cancellable, VALUE has_scheduler,
+                                    VALUE report, VALUE strict);
+static VALUE ip_compress_pixels_entry(int argc, VALUE *argv, VALUE self);
 static VALUE ip_optimize_jpeg_entry(VALUE self, VALUE input, VALUE input_kind, VALUE output,
                                     VALUE output_kind, VALUE progressive, VALUE strip_metadata,
-                                    VALUE execution, VALUE cancellable, VALUE has_scheduler);
+                                    VALUE execution, VALUE cancellable, VALUE has_scheduler,
+                                    VALUE strict);
 
 static VALUE ip_status_to_exception(ip_status_t status) {
     switch (status) {
@@ -543,10 +551,43 @@ static VALUE ip_sym(const char *name) {
     return ID2SYM(rb_intern(name));
 }
 
+static void ip_jpeg_emit_message_collect(j_common_ptr cinfo, int msg_level) {
+    if (msg_level >= 0)
+        return;
+
+    ip_jpeg_error_mgr *err = (ip_jpeg_error_mgr *)cinfo->err;
+    ip_context_t *ctx = err->ctx;
+    if (!ctx)
+        return;
+
+    ctx->warning_count++;
+    if (ctx->first_warning[0] == '\0') {
+        char buffer[JMSG_LENGTH_MAX];
+        (*cinfo->err->format_message)(cinfo, buffer);
+        snprintf(ctx->first_warning, sizeof(ctx->first_warning), "%s", buffer);
+    }
+
+    if (ctx->strict) {
+        if (ctx->status == IP_OK) {
+            char buffer[JMSG_LENGTH_MAX];
+            (*cinfo->err->format_message)(cinfo, buffer);
+            ip_context_set_error(ctx, IP_ERR_INVALID_IMAGE, buffer);
+        }
+        if (ctx->jmp_armed)
+            longjmp(ctx->jmpbuf, 1);
+    }
+}
+
+static void ip_jpeg_output_message_silent(j_common_ptr cinfo) {
+    (void)cinfo;
+}
+
 static struct jpeg_error_mgr *ip_use_error(ip_jpeg_error_mgr *jerr, ip_context_t *ctx,
                                            void (*handler)(j_common_ptr)) {
     struct jpeg_error_mgr *base = jpeg_std_error(&jerr->pub);
     jerr->pub.error_exit = handler;
+    jerr->pub.emit_message = ip_jpeg_emit_message_collect;
+    jerr->pub.output_message = ip_jpeg_output_message_silent;
     jerr->ctx = ctx;
     return base;
 }
@@ -874,6 +915,23 @@ static VALUE ip_finish_output(ip_context_t *ctx, ip_output_kind_t kind) {
 
     free(tmp_path);
     return Qtrue;
+}
+
+static VALUE ip_build_report(ip_context_t *ctx, VALUE output_value) {
+    VALUE hash = rb_hash_new();
+    rb_hash_aset(hash, ip_sym("output"), output_value);
+    rb_hash_aset(hash, ip_sym("quality"), INT2NUM(ctx->selected_quality));
+    rb_hash_aset(hash, ip_sym("ssim"),
+                 ctx->ssim_guard_enabled ? DBL2NUM(ctx->measured_ssim) : Qnil);
+    rb_hash_aset(hash, ip_sym("algo"),
+                 ctx->algo == IP_ALGO_MOZJPEG ? ip_sym("mozjpeg") : ip_sym("jpeg_turbo"));
+    rb_hash_aset(hash, ip_sym("bytesize"), SIZET2NUM(ctx->output_size));
+    rb_hash_aset(hash, ip_sym("input_bytesize"),
+                 SIZET2NUM(ctx->input_size > 0 ? ctx->input_size : ctx->pixel_size));
+    rb_hash_aset(hash, ip_sym("warning_count"), INT2NUM(ctx->warning_count));
+    rb_hash_aset(hash, ip_sym("warning"),
+                 ctx->first_warning[0] ? rb_str_new_cstr(ctx->first_warning) : Qnil);
+    return hash;
 }
 
 static int ip_save_marker(ip_context_t *ctx, int marker, const unsigned char *data,
@@ -1287,7 +1345,7 @@ static int encode_pixels_with_libjpeg(ip_context_t *ctx, int mozjpeg_size_mode) 
         ip_write_preserved_markers(ctx, &cinfo);
 
     while (cinfo.next_scanline < cinfo.image_height) {
-        if (ctx->cancellable_requested && atomic_load(&ctx->cancelled))
+        if (atomic_load(&ctx->cancelled))
             IP_FAIL_GOTO(ctx, IP_ERR_CANCELLED, "JPEG encode cancelled");
 
         JSAMPROW rows[16];
@@ -1398,7 +1456,7 @@ static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, i
         IP_FAIL_GOTO(ctx, IP_ERR_OOM, "failed to allocate decoded pixel buffer");
 
     while (cinfo.output_scanline < cinfo.output_height) {
-        if (ctx->cancellable_requested && atomic_load(&ctx->cancelled))
+        if (atomic_load(&ctx->cancelled))
             IP_FAIL_GOTO(ctx, IP_ERR_CANCELLED, "JPEG decode cancelled");
 
         JSAMPROW rows[16];
@@ -1558,7 +1616,7 @@ static int ip_decode_jpeg_to_luma_buffer(ip_context_t *ctx, const unsigned char 
         IP_FAIL_GOTO(ctx, IP_ERR_OOM, "failed to allocate luma buffer");
 
     while (cinfo.output_scanline < cinfo.output_height) {
-        if (ctx->cancellable_requested && atomic_load(&ctx->cancelled))
+        if (atomic_load(&ctx->cancelled))
             IP_FAIL_GOTO(ctx, IP_ERR_CANCELLED, "JPEG luma decode cancelled");
 
         JSAMPROW rows[16];
@@ -1791,8 +1849,7 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
     }
 
     if (reference_channels == 4) {
-        ip_context_set_error(ctx, IP_ERR_UNSUPPORTED,
-                             "min_ssim is not supported for RGBA input in v0.2.2");
+        ip_context_set_error(ctx, IP_ERR_UNSUPPORTED, "min_ssim is not supported for RGBA input");
         return 0;
     }
 
@@ -1811,7 +1868,7 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
     int best_seen_quality = 0;
 
     while (search_low <= search_high) {
-        if (ctx->cancellable_requested && atomic_load(&ctx->cancelled)) {
+        if (atomic_load(&ctx->cancelled)) {
             free(reference_luma);
             free(best_jpeg);
             ip_context_set_error(ctx, IP_ERR_CANCELLED, "SSIM-guarded JPEG encode cancelled");
@@ -1959,7 +2016,7 @@ static int ip_lossless_optimize_jpeg(ip_context_t *ctx) {
     jpeg_mem_src(&srcinfo, ctx->input_data, (unsigned long)ctx->input_size);
     ip_setup_marker_saving(&srcinfo, ctx->strip_metadata);
 
-    if (ctx->cancellable_requested && atomic_load(&ctx->cancelled))
+    if (atomic_load(&ctx->cancelled))
         IP_FAIL_GOTO(ctx, IP_ERR_CANCELLED, "lossless JPEG optimize cancelled");
 
     if (jpeg_read_header(&srcinfo, TRUE) != JPEG_HEADER_OK)
@@ -1989,7 +2046,7 @@ static int ip_lossless_optimize_jpeg(ip_context_t *ctx) {
 
     jpeg_mem_dest(&dstinfo, &ctx->transient_jpeg_buf, &jpeg_size);
 
-    if (ctx->cancellable_requested && atomic_load(&ctx->cancelled))
+    if (atomic_load(&ctx->cancelled))
         IP_FAIL_GOTO(ctx, IP_ERR_CANCELLED, "lossless JPEG optimize cancelled");
 
     jpeg_write_coefficients(&dstinfo, coef_arrays);
@@ -2035,7 +2092,7 @@ static int ip_mozjpeg_compress(ip_context_t *ctx) {
 
 static ip_execution_t ip_async_execution(const ip_context_t *ctx) {
 #if IMAGE_PACK_HAS_OFFLOAD_SAFE
-    return ctx->has_scheduler ? IP_EXEC_OFFLOAD : IP_EXEC_NOGVL;
+    return (ip_offload_runtime_enabled && ctx->has_scheduler) ? IP_EXEC_OFFLOAD : IP_EXEC_NOGVL;
 #else
     (void)ctx;
     return IP_EXEC_NOGVL;
@@ -2105,11 +2162,15 @@ static int ip_run_context(ip_context_t *ctx) {
         rb_nogvl(ip_run_encode_nogvl, ctx, ip_unblock_function, ctx, RB_NOGVL_OFFLOAD_SAFE);
 #else
         ip_context_set_error(ctx, IP_ERR_UNSUPPORTED,
-                             "offload execution requires Ruby >= 3.4; use :nogvl or :auto");
+                             "offload execution is unavailable in this runtime; it requires Ruby "
+                             ">= 3.4 and IMAGE_PACK_DISABLE_OFFLOAD must not be set");
 #endif
     } else {
         ip_context_set_error(ctx, IP_ERR_INVALID_ARGUMENT, "invalid resolved execution mode");
     }
+
+    if (ctx->resolved_execution != IP_EXEC_DIRECT)
+        rb_thread_check_ints();
 
     return ctx->status == IP_OK;
 }
@@ -2133,11 +2194,15 @@ static int ip_run_optimize_context(ip_context_t *ctx) {
         rb_nogvl(ip_run_optimize_nogvl, ctx, ip_unblock_function, ctx, RB_NOGVL_OFFLOAD_SAFE);
 #else
         ip_context_set_error(ctx, IP_ERR_UNSUPPORTED,
-                             "offload execution requires Ruby >= 3.4; use :nogvl or :auto");
+                             "offload execution is unavailable in this runtime; it requires Ruby "
+                             ">= 3.4 and IMAGE_PACK_DISABLE_OFFLOAD must not be set");
 #endif
     } else {
         ip_context_set_error(ctx, IP_ERR_INVALID_ARGUMENT, "invalid resolved execution mode");
     }
+
+    if (ctx->resolved_execution != IP_EXEC_DIRECT)
+        rb_thread_check_ints();
 
     return ctx->status == IP_OK;
 }
@@ -2220,6 +2285,7 @@ static VALUE ip_compress_jpeg_entry_body(VALUE ptr) {
     ctx->requested_execution = ip_parse_execution(call->execution);
     ctx->cancellable_requested = ip_bool_value(call->cancellable);
     ctx->has_scheduler = ip_bool_value(call->has_scheduler);
+    ctx->strict = ip_bool_value(call->strict);
     apply_configuration(call->self, ctx);
 
     ip_input_kind_t in_kind = ip_parse_input_kind(call->input_kind);
@@ -2242,17 +2308,23 @@ static VALUE ip_compress_jpeg_entry_body(VALUE ptr) {
     }
 
     ip_run_context(ctx);
+    if (ip_bool_value(call->report)) {
+        VALUE output_value = ip_finish_output(ctx, out_kind);
+        return ip_build_report(ctx, output_value);
+    }
     return ip_finish_output(ctx, out_kind);
 }
 
 static VALUE ip_compress_jpeg_entry(VALUE self, VALUE input, VALUE input_kind, VALUE output,
                                     VALUE output_kind, VALUE algo, VALUE quality, VALUE min_ssim,
                                     VALUE mozjpeg_trellis, VALUE progressive, VALUE strip_metadata,
-                                    VALUE execution, VALUE cancellable, VALUE has_scheduler) {
+                                    VALUE execution, VALUE cancellable, VALUE has_scheduler,
+                                    VALUE report, VALUE strict) {
     ip_compress_jpeg_call_t call = {
         self,           input,     input_kind,  output,          output_kind,
         algo,           quality,   min_ssim,    mozjpeg_trellis, progressive,
-        strip_metadata, execution, cancellable, has_scheduler,   NULL};
+        strip_metadata, execution, cancellable, has_scheduler,   report,
+        strict,         NULL};
     return rb_ensure(ip_compress_jpeg_entry_body, (VALUE)&call, ip_call_cleanup, (VALUE)&call.ctx);
 }
 
@@ -2277,6 +2349,7 @@ static VALUE ip_compress_pixels_entry_body(VALUE ptr) {
     ctx->requested_execution = ip_parse_execution(call->execution);
     ctx->cancellable_requested = ip_bool_value(call->cancellable);
     ctx->has_scheduler = ip_bool_value(call->has_scheduler);
+    ctx->strict = ip_bool_value(call->strict);
     apply_configuration(call->self, ctx);
 
     if (!ip_prepare_output_path(ctx, call->output, out_kind) ||
@@ -2297,18 +2370,19 @@ static VALUE ip_compress_pixels_entry_body(VALUE ptr) {
     }
 
     ip_run_context(ctx);
+    if (ip_bool_value(call->report)) {
+        VALUE output_value = ip_finish_output(ctx, out_kind);
+        return ip_build_report(ctx, output_value);
+    }
     return ip_finish_output(ctx, out_kind);
 }
 
-static VALUE ip_compress_pixels_entry(VALUE self, VALUE buffer, VALUE width, VALUE height,
-                                      VALUE channels, VALUE output, VALUE output_kind, VALUE algo,
-                                      VALUE quality, VALUE min_ssim, VALUE mozjpeg_trellis,
-                                      VALUE progressive, VALUE exact_size, VALUE execution,
-                                      VALUE cancellable, VALUE has_scheduler) {
-    ip_compress_pixels_call_t call = {
-        self,        buffer,        width,    height,          channels,    output,     output_kind,
-        algo,        quality,       min_ssim, mozjpeg_trellis, progressive, exact_size, execution,
-        cancellable, has_scheduler, NULL};
+static VALUE ip_compress_pixels_entry(int argc, VALUE *argv, VALUE self) {
+    rb_check_arity(argc, 17, 17);
+    ip_compress_pixels_call_t call = {self,     argv[0],  argv[1],  argv[2],  argv[3],
+                                      argv[4],  argv[5],  argv[6],  argv[7],  argv[8],
+                                      argv[9],  argv[10], argv[11], argv[12], argv[13],
+                                      argv[14], argv[15], argv[16], NULL};
     return rb_ensure(ip_compress_pixels_entry_body, (VALUE)&call, ip_call_cleanup,
                      (VALUE)&call.ctx);
 }
@@ -2326,6 +2400,7 @@ static VALUE ip_optimize_jpeg_entry_body(VALUE ptr) {
     ctx->requested_execution = ip_parse_execution(call->execution);
     ctx->cancellable_requested = ip_bool_value(call->cancellable);
     ctx->has_scheduler = ip_bool_value(call->has_scheduler);
+    ctx->strict = ip_bool_value(call->strict);
     ctx->ssim_guard_enabled = 0;
     apply_configuration(call->self, ctx);
 
@@ -2354,10 +2429,11 @@ static VALUE ip_optimize_jpeg_entry_body(VALUE ptr) {
 
 static VALUE ip_optimize_jpeg_entry(VALUE self, VALUE input, VALUE input_kind, VALUE output,
                                     VALUE output_kind, VALUE progressive, VALUE strip_metadata,
-                                    VALUE execution, VALUE cancellable, VALUE has_scheduler) {
-    ip_optimize_jpeg_call_t call = {
-        self,           input,     input_kind,  output,        output_kind, progressive,
-        strip_metadata, execution, cancellable, has_scheduler, NULL};
+                                    VALUE execution, VALUE cancellable, VALUE has_scheduler,
+                                    VALUE strict) {
+    ip_optimize_jpeg_call_t call = {self,        input,         input_kind,     output,
+                                    output_kind, progressive,   strip_metadata, execution,
+                                    cancellable, has_scheduler, strict,         NULL};
     return rb_ensure(ip_optimize_jpeg_entry_body, (VALUE)&call, ip_call_cleanup, (VALUE)&call.ctx);
 }
 
@@ -2403,14 +2479,17 @@ IMAGE_PACK_INIT_EXPORT void Init_image_pack(void) {
     for (size_t i = 0; i < IP_ARRAY_LEN(exceptions); i++)
         *exceptions[i].slot = rb_const_get(rb_mImagePack, rb_intern(exceptions[i].name));
 
-    rb_define_const(rb_mImagePack, "NATIVE_MOZJPEG_VERSION", rb_str_new_cstr(VERSION));
+    rb_define_const(rb_mImagePack, "NATIVE_MOZJPEG_VERSION",
+                    rb_str_new_cstr(IMAGE_PACK_MOZJPEG_VERSION));
 #if defined(IMAGE_PACK_HAS_SIMD)
     rb_define_const(rb_mImagePack, "NATIVE_SIMD", Qtrue);
 #else
     rb_define_const(rb_mImagePack, "NATIVE_SIMD", Qfalse);
 #endif
+    ip_offload_runtime_enabled = (getenv("IMAGE_PACK_DISABLE_OFFLOAD") == NULL) ? 1 : 0;
 #if IMAGE_PACK_HAS_OFFLOAD_SAFE
-    rb_define_const(rb_mImagePack, "NATIVE_OFFLOAD_SAFE", Qtrue);
+    rb_define_const(rb_mImagePack, "NATIVE_OFFLOAD_SAFE",
+                    ip_offload_runtime_enabled ? Qtrue : Qfalse);
 #else
     rb_define_const(rb_mImagePack, "NATIVE_OFFLOAD_SAFE", Qfalse);
 #endif
@@ -2419,9 +2498,9 @@ IMAGE_PACK_INIT_EXPORT void Init_image_pack(void) {
         const char *name;
         VALUE (*fn)(ANYARGS);
         int arity;
-    } methods[] = {{"__compress_jpeg", (VALUE (*)(ANYARGS))ip_compress_jpeg_entry, 13},
-                   {"__compress_pixels", (VALUE (*)(ANYARGS))ip_compress_pixels_entry, 15},
-                   {"__optimize_jpeg", (VALUE (*)(ANYARGS))ip_optimize_jpeg_entry, 9},
+    } methods[] = {{"__compress_jpeg", (VALUE (*)(ANYARGS))ip_compress_jpeg_entry, 15},
+                   {"__compress_pixels", (VALUE (*)(ANYARGS))ip_compress_pixels_entry, -1},
+                   {"__optimize_jpeg", (VALUE (*)(ANYARGS))ip_optimize_jpeg_entry, 10},
                    {"__inspect_image", (VALUE (*)(ANYARGS))ip_inspect_image_entry, 2}};
     for (size_t i = 0; i < IP_ARRAY_LEN(methods); i++) {
         rb_define_singleton_method(rb_mImagePack, methods[i].name, methods[i].fn, methods[i].arity);

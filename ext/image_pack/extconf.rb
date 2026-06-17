@@ -416,8 +416,8 @@ else
   $CFLAGS += " -O2"
 end
 
-$CFLAGS += " -DIMAGE_PACK_RUBY34_ONLY=1"
 $CFLAGS += build_info[:with_simd] ? " -DIMAGE_PACK_HAS_SIMD=1" : " -DIMAGE_PACK_PURE_C=1"
+$CPPFLAGS += " -DIMAGE_PACK_MOZJPEG_VERSION=\\\"#{MOZJPEG_VERSION}\\\""
 $LIBS += " -lm" unless msvc?
 
 have_header("ruby/thread.h") or abort "ruby/thread.h not found"
