@@ -1,6 +1,6 @@
 # image_pack
 
-`image_pack` is a Ruby-native JPEG compressor prototype for Ruby `>= 3.4.0`.
+`image_pack` is a Ruby-native JPEG compressor prototype for Ruby `>= 3.1.0`.
 
 Current version: `0.2.2`.
 
@@ -123,6 +123,25 @@ The metric is a fast native luma SSIM-like guard based on 8x8 blocks, not a full
 
 ## Execution modes
 
+### Ruby compatibility for offload
+
+ImagePack supports Ruby `>= 3.1.0`. Ruby `>= 3.4.0` is required only for the scheduler-aware `execution: :offload` path.
+
+On Ruby 3.1–3.3:
+
+- `execution: :direct` works.
+- `execution: :nogvl` works.
+- `execution: :auto` works, but never selects `:offload`.
+- explicit `execution: :offload` raises `ImagePack::UnsupportedError`.
+
+On Ruby 3.4+:
+
+- `execution: :offload` is available.
+- `execution: :auto` may select `:offload` when a Fiber scheduler is active.
+
+Use `ImagePack.offload_safe?` or `ImagePack.build_info[:offload_safe]` to check the native capability at runtime.
+
+
 ```ruby
 ImagePack.compress(jpeg, execution: :direct)
 ImagePack.compress(jpeg, execution: :nogvl)
@@ -132,8 +151,8 @@ ImagePack.compress(jpeg, execution: :auto)
 
 - `:direct` — executes under GVL, intended for small images.
 - `:nogvl` — uses `rb_nogvl(..., flags: 0)`.
-- `:offload` — uses `rb_nogvl(..., RB_NOGVL_OFFLOAD_SAFE)` on Ruby 3.4+.
-- `:auto` — header-first policy chooses direct/nogvl/offload.
+- `:offload` — uses `rb_nogvl(..., RB_NOGVL_OFFLOAD_SAFE)` on Ruby 3.4+; raises `ImagePack::UnsupportedError` on Ruby 3.1–3.3.
+- `:auto` — header-first policy chooses direct/nogvl/offload; on Ruby 3.1–3.3 it never selects offload.
 
 ## Cancellation
 
@@ -148,7 +167,7 @@ Cancellation is cooperative at decode, encode, and SSIM-search checkpoints, not 
 
 ```ruby
 ImagePack.build_info
-# => { version: "0.2.2", mozjpeg: "4.1.5", simd: true }
+# => { version: "0.2.2", mozjpeg: "4.1.5", simd: true, offload_safe: true }
 ```
 
 ## Vendoring

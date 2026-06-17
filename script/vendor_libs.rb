@@ -11,27 +11,16 @@ require "fileutils"
 require "open-uri"
 require "tmpdir"
 
+require_relative "../ext/image_pack/mozjpeg_sources"
+
 VENDOR_DIR = File.expand_path("../ext/image_pack/vendor", __dir__)
 
 MOZJPEG = {
-  version: "4.1.5",
+  version: ImagePackMozjpegSources::VERSION,
   url:     "https://github.com/mozilla/mozjpeg/archive/refs/tags/v%<version>s.tar.gz",
-  sha256:  "9fcbb7171f6ac383f5b391175d6fb3acde5e64c4c4727274eade84ed0998fcc1",
+  sha256:  ImagePackMozjpegSources::SHA256,
   strip:   "mozjpeg-%<version>s",
 }.freeze
-
-MOZJPEG_LICENSE_AND_DOC_FILES = %w[
-  LICENSE.md
-  README.md
-  README-mozilla.txt
-  README-turbo.txt
-  README.ijg
-].freeze
-
-MOZJPEG_TOPLEVEL_EXTENSIONS = %w[.c .h .in .txt].freeze
-# `.in` matters under simd/ too: simd/arm/neon-compat.h.in is the
-# CMake-generated header template that we'll process at build time.
-MOZJPEG_SIMD_EXTENSIONS = %w[.c .h .asm .inc .S .in].freeze
 
 def download(url, dest)
   puts "  Downloading #{url}..."
@@ -50,25 +39,14 @@ def verify_checksum!(tarball, name, expected_sha256)
 end
 
 def mozjpeg_file?(relative_path)
-  return false if relative_path.empty?
-
-  if relative_path.include?("/")
-    return false unless relative_path.start_with?("simd/")
-
-    ext = File.extname(relative_path)
-    return MOZJPEG_SIMD_EXTENSIONS.include?(ext)
-  end
-
-  basename = File.basename(relative_path)
-  MOZJPEG_LICENSE_AND_DOC_FILES.include?(basename) ||
-    MOZJPEG_TOPLEVEL_EXTENSIONS.include?(File.extname(basename))
+  ImagePackMozjpegSources.mozjpeg_file?(relative_path)
 end
 
 def extract_mozjpeg(tarball, dest, strip_prefix:)
   require "rubygems/package"
   require "zlib"
 
-  puts "  Extracting MozJPEG C sources (incl. SIMD)..."
+  puts "  Extracting whitelisted MozJPEG runtime sources (incl. SIMD)..."
   FileUtils.mkdir_p(dest)
 
   prefix_re = /\A#{Regexp.escape(strip_prefix)}\//

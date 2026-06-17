@@ -4,127 +4,19 @@ require "mkmf"
 require "fileutils"
 require "rbconfig"
 
-if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.4.0")
-  abort "image_pack requires Ruby >= 3.4.0; got #{RUBY_VERSION}"
+if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.1.0")
+  abort "image_pack requires Ruby >= 3.1.0; got #{RUBY_VERSION}"
 end
 
-MOZJPEG_CORE_SOURCES = %w[
-  jcapimin.c
-  jcapistd.c
-  jccoefct.c
-  jccolor.c
-  jcdctmgr.c
-  jchuff.c
-  jcext.c
-  jcicc.c
-  jcinit.c
-  jcmainct.c
-  jcmarker.c
-  jcmaster.c
-  jcomapi.c
-  jcparam.c
-  jcphuff.c
-  jcprepct.c
-  jcsample.c
-  jctrans.c
-  jdapimin.c
-  jdapistd.c
-  jdatadst.c
-  jdatasrc.c
-  jdcoefct.c
-  jdcolor.c
-  jddctmgr.c
-  jdhuff.c
-  jdicc.c
-  jdinput.c
-  jdmainct.c
-  jdmarker.c
-  jdmaster.c
-  jdmerge.c
-  jdphuff.c
-  jdpostct.c
-  jdsample.c
-  jdtrans.c
-  jerror.c
-  jfdctflt.c
-  jfdctfst.c
-  jfdctint.c
-  jidctflt.c
-  jidctfst.c
-  jidctint.c
-  jidctred.c
-  jquant1.c
-  jquant2.c
-  jutils.c
-  jmemmgr.c
-  jmemnobs.c
-].freeze
+require_relative "mozjpeg_sources"
 
-NEON_AARCH64_SOURCES = [
-  "simd/arm/aarch64/jsimd.c",
-  "simd/arm/aarch64/jchuff-neon.c",
-  "simd/arm/jccolor-neon.c",
-  "simd/arm/jcgray-neon.c",
-  "simd/arm/jcphuff-neon.c",
-  "simd/arm/jcsample-neon.c",
-  "simd/arm/jdcolor-neon.c",
-  "simd/arm/jdmerge-neon.c",
-  "simd/arm/jdsample-neon.c",
-  "simd/arm/jfdctfst-neon.c",
-  "simd/arm/jfdctint-neon.c",
-  "simd/arm/jidctfst-neon.c",
-  "simd/arm/jidctint-neon.c",
-  "simd/arm/jidctred-neon.c",
-  "simd/arm/jquanti-neon.c",
-].freeze
-
-X86_64_C_SOURCES = [
-  "simd/x86_64/jsimd.c",
-].freeze
-
-X86_64_ASM_SOURCES = %w[
-  simd/x86_64/jsimdcpu.asm
-  simd/x86_64/jfdctflt-sse.asm
-  simd/x86_64/jccolor-sse2.asm
-  simd/x86_64/jcgray-sse2.asm
-  simd/x86_64/jchuff-sse2.asm
-  simd/x86_64/jcphuff-sse2.asm
-  simd/x86_64/jcsample-sse2.asm
-  simd/x86_64/jdcolor-sse2.asm
-  simd/x86_64/jdmerge-sse2.asm
-  simd/x86_64/jdsample-sse2.asm
-  simd/x86_64/jfdctfst-sse2.asm
-  simd/x86_64/jfdctint-sse2.asm
-  simd/x86_64/jidctflt-sse2.asm
-  simd/x86_64/jidctfst-sse2.asm
-  simd/x86_64/jidctint-sse2.asm
-  simd/x86_64/jidctred-sse2.asm
-  simd/x86_64/jquantf-sse2.asm
-  simd/x86_64/jquanti-sse2.asm
-  simd/x86_64/jccolor-avx2.asm
-  simd/x86_64/jcgray-avx2.asm
-  simd/x86_64/jcsample-avx2.asm
-  simd/x86_64/jdcolor-avx2.asm
-  simd/x86_64/jdmerge-avx2.asm
-  simd/x86_64/jdsample-avx2.asm
-  simd/x86_64/jfdctint-avx2.asm
-  simd/x86_64/jidctint-avx2.asm
-  simd/x86_64/jquanti-avx2.asm
-].freeze
-
-X86_64_ASM_TEMPLATE_SOURCES = %w[
-  simd/x86_64/jccolext-sse2.asm
-  simd/x86_64/jcgryext-sse2.asm
-  simd/x86_64/jdcolext-sse2.asm
-  simd/x86_64/jdmrgext-sse2.asm
-  simd/x86_64/jccolext-avx2.asm
-  simd/x86_64/jcgryext-avx2.asm
-  simd/x86_64/jdcolext-avx2.asm
-  simd/x86_64/jdmrgext-avx2.asm
-].freeze
-
-MOZJPEG_VERSION = "4.1.5"
-MOZJPEG_VERSION_NUMBER = "4001005"
+MOZJPEG_CORE_SOURCES = ImagePackMozjpegSources::TOPLEVEL_C_SOURCES
+MOZJPEG_INCLUDE_TEMPLATES = ImagePackMozjpegSources::TOPLEVEL_INCLUDE_TEMPLATES
+NEON_AARCH64_SOURCES = ImagePackMozjpegSources::NEON_AARCH64_C_SOURCES
+X86_64_C_SOURCES = ImagePackMozjpegSources::X86_64_C_SOURCES
+X86_64_ASM_SOURCES = ImagePackMozjpegSources::X86_64_ASM_SOURCES
+MOZJPEG_VERSION = ImagePackMozjpegSources::VERSION
+MOZJPEG_VERSION_NUMBER = ImagePackMozjpegSources::VERSION_NUMBER
 
 def find_vendor_dir
   candidates = [
@@ -285,8 +177,14 @@ def select_simd_backend(mozjpeg_dir, arch)
     else
       missing = NEON_AARCH64_SOURCES.reject { |rel| File.exist?(File.join(mozjpeg_dir, rel)) }
       missing << "simd/arm/neon-compat.h.in" unless template_present
-      warn "image_pack: ARM64 detected but NEON sources missing under #{mozjpeg_dir}:"
-      missing.each { |m| warn "  - #{m}" }
+      message = "image_pack: ARM64 detected but NEON sources are incomplete under #{mozjpeg_dir}:
+"                 "#{missing.map { |m| "  - #{m}" }.join("
+")}"
+      if ENV["IMAGE_PACK_REQUIRE_SIMD"] == "1"
+        abort "#{message}
+image_pack: refusing scalar fallback because IMAGE_PACK_REQUIRE_SIMD=1."
+      end
+      warn message
       warn "image_pack: re-run `bundle exec rake vendor` after updating script/vendor_libs.rb."
       warn "image_pack: falling back to scalar."
       { kind: :none }
@@ -301,13 +199,25 @@ def select_simd_backend(mozjpeg_dir, arch)
       warn "#{message} Falling back to scalar; install nasm for ~3-4x speedup. Set IMAGE_PACK_REQUIRE_SIMD=1 to fail instead."
       { kind: :none }
     elsif !X86_64_C_SOURCES.all? { |rel| File.exist?(File.join(mozjpeg_dir, rel)) }
-      warn "image_pack: x86_64 SIMD sources missing under #{mozjpeg_dir}/simd/x86_64/. Falling back to scalar."
+      missing = X86_64_C_SOURCES.reject { |rel| File.exist?(File.join(mozjpeg_dir, rel)) }
+      message = "image_pack: x86_64 SIMD C sources missing under #{mozjpeg_dir}: #{missing.join(', ')}"
+      ENV["IMAGE_PACK_REQUIRE_SIMD"] == "1" ? abort(message) : warn("#{message}. Falling back to scalar.")
       { kind: :none }
     else
+      missing_asm = X86_64_ASM_SOURCES.reject { |rel| File.exist?(File.join(mozjpeg_dir, rel)) }
+      unless missing_asm.empty?
+        message = "image_pack: x86_64 SIMD ASM sources missing under #{mozjpeg_dir}: #{missing_asm.join(', ')}"
+        if ENV["IMAGE_PACK_REQUIRE_SIMD"] == "1"
+          abort message
+        end
+        warn "#{message}. Falling back to scalar."
+        return { kind: :none }
+      end
+
       {
         kind:           :x86_64_simd,
         c_sources:      X86_64_C_SOURCES,
-        asm_sources:    X86_64_ASM_SOURCES.select { |rel| File.exist?(File.join(mozjpeg_dir, rel)) },
+        asm_sources:    X86_64_ASM_SOURCES,
         extra_includes: [
           File.join(mozjpeg_dir, "simd"),
           File.join(mozjpeg_dir, "simd", "nasm"),
@@ -367,7 +277,8 @@ def configure_vendored_mozjpeg(vendor_dir)
 
   abort "vendored MozJPEG sources not found in #{mozjpeg_dir}" unless Dir.exist?(mozjpeg_dir)
 
-  missing_sources = MOZJPEG_CORE_SOURCES.reject { |source| File.exist?(File.join(mozjpeg_dir, source)) }
+  required_sources = MOZJPEG_CORE_SOURCES + MOZJPEG_INCLUDE_TEMPLATES
+  missing_sources = required_sources.reject { |source| File.exist?(File.join(mozjpeg_dir, source)) }
   abort "vendored MozJPEG sources are incomplete: #{missing_sources.join(', ')}" unless missing_sources.empty?
 
   arch = detect_simd_arch
