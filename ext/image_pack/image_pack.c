@@ -137,6 +137,7 @@ typedef struct {
     int progressive;
     int strip_metadata;
     int mozjpeg_trellis_enabled;
+    int mozjpeg_scan_opt_enabled;
     ip_algo_t algo;
     ip_execution_t requested_execution;
     ip_execution_t resolved_execution;
@@ -173,6 +174,7 @@ typedef struct {
     unsigned char *transient_jpeg_buf;
     unsigned char *transient_decode_buf;
     int source_orientation;
+    int decoded_as_ycbcr;
 } ip_context_t;
 
 typedef struct {
@@ -251,7 +253,8 @@ static int ip_run_context(ip_context_t *ctx);
 static void validate_limits_for_pixels(ip_context_t *ctx);
 
 static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, int *width,
-                                    int *height, int *channels, int fast_decode_mode);
+                                    int *height, int *channels, int fast_decode_mode,
+                                    int allow_ycbcr_transcode);
 static int ip_decode_jpeg_to_luma_buffer(ip_context_t *ctx, const unsigned char *data, size_t size,
                                          unsigned char **luma, int *width, int *height);
 static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_size_mode);
@@ -263,14 +266,14 @@ static int ip_run_optimize_context(ip_context_t *ctx);
 typedef struct {
     VALUE self, input, input_kind, output, output_kind, algo, quality, min_ssim;
     VALUE mozjpeg_trellis, progressive, strip_metadata, execution, cancellable, has_scheduler;
-    VALUE report, strict;
+    VALUE report, strict, mozjpeg_scan_opt;
     ip_context_t *ctx;
 } ip_compress_jpeg_call_t;
 
 typedef struct {
     VALUE self, buffer, width, height, channels, output, output_kind, algo, quality, min_ssim;
     VALUE mozjpeg_trellis, progressive, exact_size, execution, cancellable, has_scheduler;
-    VALUE report, strict;
+    VALUE report, strict, mozjpeg_scan_opt;
     ip_context_t *ctx;
 } ip_compress_pixels_call_t;
 
@@ -294,11 +297,7 @@ static VALUE ip_call_cleanup(VALUE ptr) {
     return Qnil;
 }
 
-static VALUE ip_compress_jpeg_entry(VALUE self, VALUE input, VALUE input_kind, VALUE output,
-                                    VALUE output_kind, VALUE algo, VALUE quality, VALUE min_ssim,
-                                    VALUE mozjpeg_trellis, VALUE progressive, VALUE strip_metadata,
-                                    VALUE execution, VALUE cancellable, VALUE has_scheduler,
-                                    VALUE report, VALUE strict);
+static VALUE ip_compress_jpeg_entry(int argc, VALUE *argv, VALUE self);
 static VALUE ip_compress_pixels_entry(int argc, VALUE *argv, VALUE self);
 static VALUE ip_optimize_jpeg_entry(VALUE self, VALUE input, VALUE input_kind, VALUE output,
                                     VALUE output_kind, VALUE progressive, VALUE strip_metadata,
@@ -448,6 +447,7 @@ static ip_context_t *ip_context_new(void) {
     ctx->status = IP_OK;
     ctx->quality = 82;
     ctx->mozjpeg_trellis_enabled = 1;
+    ctx->mozjpeg_scan_opt_enabled = 1;
     ctx->selected_quality = 82;
     ctx->requested_execution = IP_EXEC_AUTO;
     ctx->resolved_execution = IP_EXEC_AUTO;
@@ -1277,13 +1277,21 @@ static void configure_mozjpeg_profile_before_defaults(struct jpeg_compress_struc
 static void configure_mozjpeg_features_after_defaults(struct jpeg_compress_struct *cinfo,
                                                       int mozjpeg_size_mode,
                                                       int progressive_requested,
-                                                      int mozjpeg_trellis_enabled) {
+                                                      int mozjpeg_trellis_enabled,
+                                                      int scan_opt_enabled, int measurement) {
     if (mozjpeg_size_mode) {
         cinfo->optimize_coding = TRUE;
 
         if (progressive_requested) {
+            if (mozjpeg_trellis_enabled) {
+                jpeg_c_set_bool_param(cinfo, JBOOLEAN_USE_SCANS_IN_TRELLIS, TRUE);
+                jpeg_c_set_bool_param(cinfo, JBOOLEAN_TRELLIS_EOB_OPT, TRUE);
+            }
+            jpeg_c_set_int_param(cinfo, JINT_DC_SCAN_OPT_MODE, 2);
+            int run_scan_search = (measurement || !scan_opt_enabled) ? FALSE : TRUE;
+            jpeg_c_set_bool_param(cinfo, JBOOLEAN_OPTIMIZE_SCANS, run_scan_search);
             jpeg_simple_progression(cinfo);
-            jpeg_c_set_bool_param(cinfo, JBOOLEAN_OPTIMIZE_SCANS, TRUE);
+            jpeg_c_set_bool_param(cinfo, JBOOLEAN_OPTIMIZE_SCANS, run_scan_search);
         } else {
             cinfo->scan_info = NULL;
             cinfo->num_scans = 0;
@@ -1308,7 +1316,7 @@ static void configure_mozjpeg_features_after_defaults(struct jpeg_compress_struc
     }
 }
 
-static int encode_pixels_with_libjpeg(ip_context_t *ctx, int mozjpeg_size_mode) {
+static int encode_pixels_with_libjpeg(ip_context_t *ctx, int mozjpeg_size_mode, int measurement) {
     struct jpeg_compress_struct cinfo;
     ip_jpeg_error_mgr jerr;
     unsigned long jpeg_size = 0;
@@ -1330,14 +1338,19 @@ static int encode_pixels_with_libjpeg(ip_context_t *ctx, int mozjpeg_size_mode) 
     cinfo.image_width = (JDIMENSION)ctx->width;
     cinfo.image_height = (JDIMENSION)ctx->height;
     cinfo.input_components = ctx->channels;
-    cinfo.in_color_space =
-        ctx->channels == 4 ? JCS_EXT_RGBA : color_space_for_channels(ctx->channels);
+    if (ctx->decoded_as_ycbcr && ctx->channels == 3) {
+        cinfo.in_color_space = JCS_YCbCr;
+    } else {
+        cinfo.in_color_space =
+            ctx->channels == 4 ? JCS_EXT_RGBA : color_space_for_channels(ctx->channels);
+    }
 
     configure_mozjpeg_profile_before_defaults(&cinfo, mozjpeg_size_mode);
     jpeg_set_defaults(&cinfo);
     jpeg_set_quality(&cinfo, ctx->quality, TRUE);
     configure_mozjpeg_features_after_defaults(&cinfo, mozjpeg_size_mode, ctx->progressive,
-                                              ctx->mozjpeg_trellis_enabled);
+                                              ctx->mozjpeg_trellis_enabled,
+                                              ctx->mozjpeg_scan_opt_enabled, measurement);
 
     jpeg_start_compress(&cinfo, TRUE);
 
@@ -1363,7 +1376,7 @@ static int encode_pixels_with_libjpeg(ip_context_t *ctx, int mozjpeg_size_mode) 
 
     jpeg_finish_compress(&cinfo);
 
-    if (ctx->max_output_size > 0 && (size_t)jpeg_size > ctx->max_output_size)
+    if (!measurement && ctx->max_output_size > 0 && (size_t)jpeg_size > ctx->max_output_size)
         IP_FAIL_GOTO(ctx, IP_ERR_LIMIT, "output exceeds max_output_size");
 
     jpeg_destroy_compress(&cinfo);
@@ -1384,7 +1397,8 @@ fail:
 }
 
 static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, int *width,
-                                    int *height, int *channels, int fast_decode_mode) {
+                                    int *height, int *channels, int fast_decode_mode,
+                                    int allow_ycbcr_transcode) {
     struct jpeg_decompress_struct cinfo;
     ip_jpeg_error_mgr jerr;
     memset(&cinfo, 0, sizeof(cinfo));
@@ -1392,6 +1406,7 @@ static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, i
     cinfo.err = ip_use_error(&jerr, ctx, ip_jpeg_invalid_error_exit);
     ctx->transient_decode_buf = NULL;
     ctx->source_orientation = 1;
+    ctx->decoded_as_ycbcr = 0;
 
     ctx->jmp_armed = 1;
     if (setjmp(ctx->jmpbuf)) {
@@ -1435,7 +1450,9 @@ static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, i
     if (ctx->status != IP_OK)
         goto fail;
 
-    cinfo.out_color_space = ch == 1 ? JCS_GRAYSCALE : JCS_RGB;
+    int use_ycbcr = allow_ycbcr_transcode && ch == 3;
+    cinfo.out_color_space = ch == 1 ? JCS_GRAYSCALE : (use_ycbcr ? JCS_YCbCr : JCS_RGB);
+    ctx->decoded_as_ycbcr = use_ycbcr;
     if (fast_decode_mode)
         ip_apply_fast_decode(&cinfo);
 
@@ -1513,14 +1530,14 @@ fail:
 
 static int compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_size_mode) {
     if (ctx->pixel_data) {
-        return encode_pixels_with_libjpeg(ctx, mozjpeg_size_mode);
+        return encode_pixels_with_libjpeg(ctx, mozjpeg_size_mode, 0);
     }
 
     unsigned char *pixels = NULL;
     int width = 0;
     int height = 0;
     int channels = 0;
-    if (!ip_jpeg_decode_to_pixels(ctx, &pixels, &width, &height, &channels, !mozjpeg_size_mode))
+    if (!ip_jpeg_decode_to_pixels(ctx, &pixels, &width, &height, &channels, !mozjpeg_size_mode, 1))
         return 0;
 
     ctx->owned_pixel_data = pixels;
@@ -1531,7 +1548,7 @@ static int compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_size_mod
     ctx->channels = channels;
     ctx->decoded_bytes = ctx->pixel_size;
 
-    return encode_pixels_with_libjpeg(ctx, mozjpeg_size_mode);
+    return encode_pixels_with_libjpeg(ctx, mozjpeg_size_mode, 0);
 }
 
 static void ip_clear_output_buffer(ip_context_t *ctx) {
@@ -1821,6 +1838,49 @@ static double ip_compute_ssim_luma_buffer(const unsigned char *a, const unsigned
     return windows > 0 ? total_ssim / (double)windows : 0.0;
 }
 
+static int ip_guard_score_quality(ip_context_t *ctx, int mozjpeg_size_mode, int measurement,
+                                  const unsigned char *reference_luma, int reference_width,
+                                  int reference_height, unsigned char **out_jpeg,
+                                  size_t *out_jpeg_size, double *out_ssim) {
+    *out_jpeg = NULL;
+    *out_jpeg_size = 0;
+    *out_ssim = 0.0;
+
+    ip_clear_output_buffer(ctx);
+    if (!encode_pixels_with_libjpeg(ctx, mozjpeg_size_mode, measurement))
+        return 0;
+
+    unsigned char *candidate_jpeg = ctx->output_data;
+    size_t candidate_jpeg_size = ctx->output_size;
+    ctx->output_data = NULL;
+    ctx->output_size = 0;
+    ctx->output_owner = IP_OUTPUT_OWNER_NONE;
+
+    unsigned char *candidate_luma = NULL;
+    int candidate_width = 0;
+    int candidate_height = 0;
+    if (!ip_decode_jpeg_to_luma_buffer(ctx, candidate_jpeg, candidate_jpeg_size, &candidate_luma,
+                                       &candidate_width, &candidate_height)) {
+        free(candidate_jpeg);
+        return 0;
+    }
+
+    if (candidate_width != reference_width || candidate_height != reference_height) {
+        free(candidate_luma);
+        free(candidate_jpeg);
+        ip_context_set_error(ctx, IP_ERR_ENCODE,
+                             "candidate JPEG dimensions differ from reference image");
+        return 0;
+    }
+
+    *out_ssim = ip_compute_ssim_luma_buffer(reference_luma, candidate_luma, reference_width,
+                                            reference_height);
+    free(candidate_luma);
+    *out_jpeg = candidate_jpeg;
+    *out_jpeg_size = candidate_jpeg_size;
+    return 1;
+}
+
 static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_size_mode) {
     unsigned char *reference_pixels = NULL;
     int reference_width = 0;
@@ -1834,7 +1894,7 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
         reference_channels = ctx->channels;
     } else {
         if (!ip_jpeg_decode_to_pixels(ctx, &reference_pixels, &reference_width, &reference_height,
-                                      &reference_channels, 1)) {
+                                      &reference_channels, 1, 0)) {
             return 0;
         }
 
@@ -1866,6 +1926,10 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
     size_t best_jpeg_size = 0;
     double best_seen_ssim = 0.0;
     int best_seen_quality = 0;
+    int probe_measurement = mozjpeg_size_mode ? 1 : 0;
+    int have_lo = 0, have_hi = 0;
+    int q_lo = 0, q_hi = 0;
+    double s_lo = 0.0, s_hi = 0.0;
 
     while (search_low <= search_high) {
         if (atomic_load(&ctx->cancelled)) {
@@ -1875,49 +1939,31 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
             return 0;
         }
 
-        int trial_quality = search_low + ((search_high - search_low) / 2);
+        int trial_quality;
+        if (have_lo && have_hi && s_hi > s_lo) {
+            double t = (ctx->min_ssim - s_lo) / (s_hi - s_lo);
+            double q_est = (double)q_lo + t * (double)(q_hi - q_lo);
+            trial_quality = (int)(q_est + 0.5);
+            if (trial_quality < search_low)
+                trial_quality = search_low;
+            if (trial_quality > search_high)
+                trial_quality = search_high;
+        } else {
+            trial_quality = search_low + ((search_high - search_low) / 2);
+        }
+
         ctx->quality = trial_quality;
-        ip_clear_output_buffer(ctx);
 
-        if (!encode_pixels_with_libjpeg(ctx, mozjpeg_size_mode)) {
+        unsigned char *candidate_jpeg = NULL;
+        size_t candidate_jpeg_size = 0;
+        double ssim = 0.0;
+        if (!ip_guard_score_quality(ctx, mozjpeg_size_mode, probe_measurement, reference_luma,
+                                    reference_width, reference_height, &candidate_jpeg,
+                                    &candidate_jpeg_size, &ssim)) {
             free(reference_luma);
             free(best_jpeg);
             return 0;
         }
-
-        unsigned char *candidate_jpeg = ctx->output_data;
-        size_t candidate_jpeg_size = ctx->output_size;
-        ctx->output_data = NULL;
-        ctx->output_size = 0;
-        ctx->output_owner = IP_OUTPUT_OWNER_NONE;
-
-        unsigned char *candidate_luma = NULL;
-        int candidate_width = 0;
-        int candidate_height = 0;
-        int decoded_ok =
-            ip_decode_jpeg_to_luma_buffer(ctx, candidate_jpeg, candidate_jpeg_size, &candidate_luma,
-                                          &candidate_width, &candidate_height);
-
-        if (!decoded_ok) {
-            free(reference_luma);
-            free(candidate_jpeg);
-            free(best_jpeg);
-            return 0;
-        }
-
-        if (candidate_width != reference_width || candidate_height != reference_height) {
-            free(reference_luma);
-            free(candidate_luma);
-            free(candidate_jpeg);
-            free(best_jpeg);
-            ip_context_set_error(ctx, IP_ERR_ENCODE,
-                                 "candidate JPEG dimensions differ from reference image");
-            return 0;
-        }
-
-        double ssim = ip_compute_ssim_luma_buffer(reference_luma, candidate_luma, reference_width,
-                                                  reference_height);
-        free(candidate_luma);
 
         if (ssim > best_seen_ssim) {
             best_seen_ssim = ssim;
@@ -1930,9 +1976,15 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
             best_jpeg_size = candidate_jpeg_size;
             best_quality = trial_quality;
             best_ssim = ssim;
+            q_hi = trial_quality;
+            s_hi = ssim;
+            have_hi = 1;
             search_high = trial_quality - 1;
         } else {
             free(candidate_jpeg);
+            q_lo = trial_quality;
+            s_lo = ssim;
+            have_lo = 1;
             search_low = trial_quality + 1;
         }
     }
@@ -1947,13 +1999,75 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
         return 0;
     }
 
-    ctx->quality = best_quality;
-    ctx->selected_quality = best_quality;
-    ctx->measured_ssim = best_ssim;
+    if (!mozjpeg_size_mode) {
+        ctx->quality = best_quality;
+        ctx->selected_quality = best_quality;
+        ctx->measured_ssim = best_ssim;
+        free(reference_luma);
+        ctx->output_data = best_jpeg;
+        ctx->output_size = best_jpeg_size;
+        ctx->output_owner = IP_OUTPUT_OWNER_MALLOC;
+        return 1;
+    }
+
+    free(best_jpeg);
+    best_jpeg = NULL;
+
+    int final_quality = best_quality;
+    unsigned char *final_jpeg = NULL;
+    size_t final_jpeg_size = 0;
+    double final_ssim = 0.0;
+    int satisfied = 0;
+
+    while (final_quality <= 100) {
+        if (atomic_load(&ctx->cancelled)) {
+            free(final_jpeg);
+            free(reference_luma);
+            ip_context_set_error(ctx, IP_ERR_CANCELLED, "SSIM-guarded JPEG encode cancelled");
+            return 0;
+        }
+
+        ctx->quality = final_quality;
+        unsigned char *jpeg = NULL;
+        size_t jpeg_size = 0;
+        double ssim = 0.0;
+        if (!ip_guard_score_quality(ctx, mozjpeg_size_mode, 0, reference_luma, reference_width,
+                                    reference_height, &jpeg, &jpeg_size, &ssim)) {
+            free(final_jpeg);
+            free(reference_luma);
+            return 0;
+        }
+
+        free(final_jpeg);
+        final_jpeg = jpeg;
+        final_jpeg_size = jpeg_size;
+        final_ssim = ssim;
+
+        if (ssim >= ctx->min_ssim) {
+            satisfied = 1;
+            break;
+        }
+        final_quality++;
+    }
+
+    if (!satisfied) {
+        char message[512];
+        snprintf(message, sizeof(message),
+                 "cannot satisfy min_ssim=%.6f; best full-profile SSIM %.6f at quality=100",
+                 ctx->min_ssim, final_ssim);
+        free(final_jpeg);
+        free(reference_luma);
+        ip_context_set_error(ctx, IP_ERR_QUALITY, message);
+        return 0;
+    }
+
     free(reference_luma);
 
-    ctx->output_data = best_jpeg;
-    ctx->output_size = best_jpeg_size;
+    ctx->quality = final_quality;
+    ctx->selected_quality = final_quality;
+    ctx->measured_ssim = final_ssim;
+    ctx->output_data = final_jpeg;
+    ctx->output_size = final_jpeg_size;
     ctx->output_owner = IP_OUTPUT_OWNER_MALLOC;
     return 1;
 }
@@ -2280,6 +2394,7 @@ static VALUE ip_compress_jpeg_entry_body(VALUE ptr) {
     ctx->ssim_guard_enabled = ctx->min_ssim > 0.0;
     ip_validate_min_ssim_or_raise(ctx);
     ctx->mozjpeg_trellis_enabled = ip_bool_value(call->mozjpeg_trellis);
+    ctx->mozjpeg_scan_opt_enabled = ip_bool_value(call->mozjpeg_scan_opt);
     ctx->progressive = ip_bool_value(call->progressive);
     ctx->strip_metadata = ip_bool_value(call->strip_metadata);
     ctx->requested_execution = ip_parse_execution(call->execution);
@@ -2315,16 +2430,11 @@ static VALUE ip_compress_jpeg_entry_body(VALUE ptr) {
     return ip_finish_output(ctx, out_kind);
 }
 
-static VALUE ip_compress_jpeg_entry(VALUE self, VALUE input, VALUE input_kind, VALUE output,
-                                    VALUE output_kind, VALUE algo, VALUE quality, VALUE min_ssim,
-                                    VALUE mozjpeg_trellis, VALUE progressive, VALUE strip_metadata,
-                                    VALUE execution, VALUE cancellable, VALUE has_scheduler,
-                                    VALUE report, VALUE strict) {
-    ip_compress_jpeg_call_t call = {
-        self,           input,     input_kind,  output,          output_kind,
-        algo,           quality,   min_ssim,    mozjpeg_trellis, progressive,
-        strip_metadata, execution, cancellable, has_scheduler,   report,
-        strict,         NULL};
+static VALUE ip_compress_jpeg_entry(int argc, VALUE *argv, VALUE self) {
+    rb_check_arity(argc, 16, 16);
+    ip_compress_jpeg_call_t call = {self,     argv[0],  argv[1],  argv[2],  argv[3],  argv[4],
+                                    argv[5],  argv[6],  argv[7],  argv[8],  argv[9],  argv[10],
+                                    argv[11], argv[12], argv[13], argv[14], argv[15], NULL};
     return rb_ensure(ip_compress_jpeg_entry_body, (VALUE)&call, ip_call_cleanup, (VALUE)&call.ctx);
 }
 
@@ -2344,6 +2454,7 @@ static VALUE ip_compress_pixels_entry_body(VALUE ptr) {
     ctx->ssim_guard_enabled = ctx->min_ssim > 0.0;
     ip_validate_min_ssim_or_raise(ctx);
     ctx->mozjpeg_trellis_enabled = ip_bool_value(call->mozjpeg_trellis);
+    ctx->mozjpeg_scan_opt_enabled = ip_bool_value(call->mozjpeg_scan_opt);
     ctx->progressive = ip_bool_value(call->progressive);
     ctx->strip_metadata = 1;
     ctx->requested_execution = ip_parse_execution(call->execution);
@@ -2378,11 +2489,11 @@ static VALUE ip_compress_pixels_entry_body(VALUE ptr) {
 }
 
 static VALUE ip_compress_pixels_entry(int argc, VALUE *argv, VALUE self) {
-    rb_check_arity(argc, 17, 17);
+    rb_check_arity(argc, 18, 18);
     ip_compress_pixels_call_t call = {self,     argv[0],  argv[1],  argv[2],  argv[3],
                                       argv[4],  argv[5],  argv[6],  argv[7],  argv[8],
                                       argv[9],  argv[10], argv[11], argv[12], argv[13],
-                                      argv[14], argv[15], argv[16], NULL};
+                                      argv[14], argv[15], argv[16], argv[17], NULL};
     return rb_ensure(ip_compress_pixels_entry_body, (VALUE)&call, ip_call_cleanup,
                      (VALUE)&call.ctx);
 }
@@ -2498,7 +2609,7 @@ IMAGE_PACK_INIT_EXPORT void Init_image_pack(void) {
         const char *name;
         VALUE (*fn)(ANYARGS);
         int arity;
-    } methods[] = {{"__compress_jpeg", (VALUE (*)(ANYARGS))ip_compress_jpeg_entry, 15},
+    } methods[] = {{"__compress_jpeg", (VALUE (*)(ANYARGS))ip_compress_jpeg_entry, -1},
                    {"__compress_pixels", (VALUE (*)(ANYARGS))ip_compress_pixels_entry, -1},
                    {"__optimize_jpeg", (VALUE (*)(ANYARGS))ip_optimize_jpeg_entry, 10},
                    {"__inspect_image", (VALUE (*)(ANYARGS))ip_inspect_image_entry, 2}};

@@ -121,7 +121,8 @@ module ImagePack
                  quality: nil,
                  min_ssim: nil,
                  mozjpeg_trellis: true,
-                 progressive: false,
+                 mozjpeg_scan_opt: true,
+                 progressive: nil,
                  strip_metadata: true,
                  execution: nil,
                  cancellable: false,
@@ -130,6 +131,8 @@ module ImagePack
       validate_algo!(algo)
       validate_min_ssim!(min_ssim)
       validate_boolean!(:mozjpeg_trellis, mozjpeg_trellis)
+      validate_boolean!(:mozjpeg_scan_opt, mozjpeg_scan_opt)
+      progressive = default_progressive_for(algo, progressive)
       validate_boolean!(:progressive, progressive)
       validate_boolean!(:strip_metadata, strip_metadata)
       validate_boolean!(:cancellable, cancellable)
@@ -159,7 +162,8 @@ module ImagePack
                       cancellable ? 1 : 0,
                       has_scheduler ? 1 : 0,
                       report ? 1 : 0,
-                      strict ? 1 : 0)
+                      strict ? 1 : 0,
+                      mozjpeg_scan_opt ? 1 : 0)
     end
 
     def compress_pixels(buffer,
@@ -171,7 +175,8 @@ module ImagePack
                         quality: nil,
                         min_ssim: nil,
                         mozjpeg_trellis: true,
-                        progressive: false,
+                        mozjpeg_scan_opt: true,
+                        progressive: nil,
                         drop_alpha: nil,
                         exact_size: false,
                         execution: nil,
@@ -182,6 +187,8 @@ module ImagePack
       validate_algo!(algo)
       validate_min_ssim!(min_ssim)
       validate_boolean!(:mozjpeg_trellis, mozjpeg_trellis)
+      validate_boolean!(:mozjpeg_scan_opt, mozjpeg_scan_opt)
+      progressive = default_progressive_for(algo, progressive)
       validate_boolean!(:progressive, progressive)
       validate_drop_alpha!(drop_alpha)
       validate_boolean!(:exact_size, exact_size)
@@ -229,7 +236,8 @@ module ImagePack
                         cancellable ? 1 : 0,
                         has_scheduler ? 1 : 0,
                         report ? 1 : 0,
-                        strict ? 1 : 0)
+                        strict ? 1 : 0,
+                        mozjpeg_scan_opt ? 1 : 0)
     end
 
     def inspect_image(input)
@@ -292,6 +300,13 @@ module ImagePack
       return if value == true || value == false
 
       raise InvalidArgumentError, "#{name} must be true or false, got: #{value.inspect}"
+    end
+
+
+    def default_progressive_for(algo, value)
+      return value unless value.nil?
+
+      ALGO_TO_NATIVE.fetch(algo) == :mozjpeg
     end
 
     def validate_drop_alpha!(value)

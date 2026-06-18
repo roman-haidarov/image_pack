@@ -45,17 +45,22 @@ ImagePack.compress_bytes(jpeg,
 
 Algorithms:
 
-- `:size` / `:mozjpeg` — smaller files, default
-- `:fast` / `:jpeg_turbo` — faster mode
+- `:size` / `:mozjpeg` — smaller files, default; uses optimized progressive MozJPEG output by default
+- `:fast` / `:jpeg_turbo` — faster baseline mode
 
 Common options:
 
 ```ruby
 ImagePack.compress_bytes(jpeg, min_ssim: 0.985)
-ImagePack.compress_bytes(jpeg, progressive: true)
+ImagePack.compress_bytes(jpeg, progressive: false) # force baseline output
 ImagePack.compress_bytes(jpeg, strict: true)
 ImagePack.compress_bytes(jpeg, report: true)
 ```
+
+
+`algo: :size` / `:mozjpeg` now defaults to optimized progressive scans plus scan-aware MozJPEG trellis tuning because that is the strongest built-in size profile used by the gem. Pass `progressive: false` when you explicitly need baseline JPEG output.
+
+`algo: :fast` / `:jpeg_turbo` keeps baseline output by default and remains the throughput path.
 
 `min_ssim:` searches for the lowest acceptable quality using a fast native luma SSIM guard.
 
@@ -155,15 +160,18 @@ end
 bundle exec rake vendor
 bundle exec rake compile
 bundle exec rake test
+bundle exec rake release:check
 ```
 
 `rake vendor` pins MozJPEG `v4.1.5`.
+
+`rake release:check` compiles, verifies tests, and fails release builds when SIMD is unavailable. Set `IMAGE_PACK_ALLOW_SCALAR=1` only when intentionally shipping a scalar build.
 
 ## Limits
 
 - JPEG only.
 - Ruby `>= 3.1`; `execution: :offload` requires Ruby `>= 3.4`.
 - Pixel-level `compress` rejects CMYK/YCCK JPEG input; use `optimize_jpeg` for existing CMYK/YCCK JPEGs.
-- Arithmetic-coded JPEG support is disabled in `0.2.4`.
+- Arithmetic-coded JPEG support is disabled in `0.2.5`.
 - Streaming output is not supported; file output uses atomic write-through-temp-file and rename.
 - `ImagePack.compress(input, ...)` keeps a legacy path-vs-bytes heuristic; prefer explicit `*_bytes` / `*_file` helpers.
