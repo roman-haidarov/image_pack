@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0
+
+- Breaking API change: `algo:` has been removed. Use `engine:` instead (`:turbo` replaces `:fast`, `:mozjpeg` replaces `:size`).
+- `report: true` now returns `engine:` instead of `algo:`.
+- The default engine is `:mozjpeg`, compiled in-process from vendored sources; a plain `compress` call has no external dependencies and always works.
+- Added `:jpegli` as an explicit, experimental, opt-in engine. It is never selected implicitly, so behaviour does not change based on whether a `cjpegli` binary happens to be on `PATH`.
+- jpegli shells out to an external `cjpegli` resolved from `IMAGE_PACK_JPEGLI_BIN` or `PATH`; no jpegli binary is bundled in the gem. `rake vendor` builds it only when `IMAGE_PACK_VENDOR_JPEGLI=1`.
+- jpegli hardening: the helper output is validated through the native JPEG parser (otherwise `EncodeError`); the child runs with stdin/stdout/stderr redirected to `/dev/null`; the child is killed after `IMAGE_PACK_JPEGLI_TIMEOUT_MS` (default 15000, `0` disables); temporary files are created inside a private `0700` directory.
+- Fixed an input-ownership data race: jpegli is resolved to an off-GVL execution mode before the input/pixel buffer is copied for asynchronous use, so the helper never reads live Ruby `String` memory without the GVL.
+- The resolved `cjpegli` path is passed to the native extension as a call argument; compression no longer mutates the process-wide `ENV`.
+- `min_ssim:` and `cancellable: true` are rejected for `engine: :jpegli` instead of silently implying unsupported helper semantics. Ruby thread interruption still terminates the child process.
+- Kept the MozJPEG-backed engines as `engine: :turbo` and `engine: :mozjpeg`, compiled in-process from vendored sources.
+- `__compress_jpeg` is registered with a variadic native arity to stay within the Ruby C-API fixed-arity limit.
+- Updated README, THIRD_PARTY_NOTICES, tests, and gem metadata; the gem packages source only.
+
 ## 0.2.4
 
 - libjpeg/MozJPEG diagnostics are no longer written to `stderr`; instead decode warnings (e.g. "Premature end of JPEG file") are counted and the first message is captured, so a damaged or truncated input is observable rather than silently degraded.

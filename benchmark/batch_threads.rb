@@ -12,7 +12,7 @@ started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 threads.times.map do
   Thread.new do
     iterations.times do
-      ImagePack.compress(bytes, algo: :mozjpeg, quality: 82, execution: :nogvl)
+      ImagePack.compress(bytes, engine: :mozjpeg, quality: 82, execution: :nogvl)
     end
   end
 end.each(&:join)

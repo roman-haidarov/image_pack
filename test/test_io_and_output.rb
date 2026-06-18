@@ -8,9 +8,9 @@ class TestIoAndOutput < Minitest::Test
   def test_compress_accepts_path_input
     Dir.mktmpdir("image_pack_test") do |dir|
       input_path = File.join(dir, "input.jpg")
-      File.binwrite(input_path, sample_jpeg(algo: :jpeg_turbo, quality: 90))
+      File.binwrite(input_path, sample_jpeg(engine: :turbo, quality: 90))
 
-      out = ImagePack.compress(input_path, algo: :jpeg_turbo, quality: 82, execution: :direct)
+      out = ImagePack.compress(input_path, engine: :turbo, quality: 82, execution: :direct)
 
       assert_jpeg out
     end
@@ -26,7 +26,7 @@ class TestIoAndOutput < Minitest::Test
         height: DEFAULT_HEIGHT,
         channels: DEFAULT_CHANNELS,
         output: output_path,
-        algo: :jpeg_turbo,
+        engine: :turbo,
         quality: 82,
         execution: :direct
       )
@@ -47,7 +47,7 @@ class TestIoAndOutput < Minitest::Test
                                          height: DEFAULT_HEIGHT,
                                          channels: DEFAULT_CHANNELS,
                                          output: output_path,
-                                         algo: :jpeg_turbo,
+                                         engine: :turbo,
                                          quality: 82,
                                          execution: :direct)
 
@@ -61,7 +61,7 @@ class TestIoAndOutput < Minitest::Test
     Dir.mktmpdir("image_pack_test") do |dir|
       input_path = File.join(dir, "input.jpg")
       output_path = File.join(dir, "output.jpg")
-      File.binwrite(input_path, sample_jpeg(algo: :jpeg_turbo, quality: 90))
+      File.binwrite(input_path, sample_jpeg(engine: :turbo, quality: 90))
 
       result = ImagePack.optimize_file(input_path, output: output_path, execution: :direct)
 
@@ -79,7 +79,7 @@ class TestIoAndOutput < Minitest::Test
                                     width: DEFAULT_WIDTH,
                                     height: DEFAULT_HEIGHT,
                                     channels: DEFAULT_CHANNELS,
-                                    algo: :jpeg_turbo,
+                                    engine: :turbo,
                                     quality: 82,
                                     execution: :direct)
 
@@ -93,7 +93,7 @@ class TestIoAndOutput < Minitest::Test
                                     width: DEFAULT_WIDTH,
                                     height: DEFAULT_HEIGHT,
                                     channels: DEFAULT_CHANNELS,
-                                    algo: :jpeg_turbo,
+                                    engine: :turbo,
                                     quality: 82,
                                     execution: :direct)
     assert_jpeg out
@@ -104,7 +104,7 @@ class TestIoAndOutput < Minitest::Test
                                 height: DEFAULT_HEIGHT,
                                 channels: DEFAULT_CHANNELS,
                                 exact_size: true,
-                                algo: :jpeg_turbo,
+                                engine: :turbo,
                                 quality: 82,
                                 execution: :direct)
     end

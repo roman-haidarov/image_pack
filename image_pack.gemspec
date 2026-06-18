@@ -9,17 +9,17 @@ Gem::Specification.new do |spec|
   spec.authors       = ["Roman Haydarov"]
   spec.email         = ["romnhajdarov@gmail.com"]
 
-  spec.summary       = "Ruby-native pure-C JPEG runtime: MozJPEG/libjpeg"
-  spec.description   = "Single API, vendored pure-C MozJPEG/libjpeg codec, in-memory compression and atomic file output, " \
-                       "Ruby 3.1+ native JPEG execution; Ruby 3.4+ enables Fiber::Scheduler-aware offload. " \
-                       "Ships vendored C sources — no system libjpeg, git, or CMake required."
+  spec.summary       = "Ruby-native JPEG compression with vendored MozJPEG"
+  spec.description   = "In-process JPEG compression with MozJPEG/libjpeg engines compiled from vendored sources, " \
+                       "atomic file output, and an optional jpegli engine via an external cjpegli helper. " \
+                       "Ruby 3.1+ native JPEG execution; Ruby 3.4+ enables Fiber::Scheduler-aware offload."
   spec.homepage      = "https://github.com/roman-haidarov/image_pack"
   spec.license       = "MIT"
   spec.required_ruby_version = ">= 3.1.0"
 
   spec.metadata["homepage_uri"]    = spec.homepage
   spec.metadata["source_code_uri"] = spec.homepage
-  spec.metadata["changelog_uri"]   = "#{spec.homepage}/blob/main/CHANGELOG.md"
+  spec.metadata["changelog_uri"]   = "#{spec.homepage}/blob/v#{ImagePack::VERSION}/CHANGELOG.md"
 
   mozjpeg_dir = "ext/image_pack/vendor/mozjpeg"
   mozjpeg_runtime_sources = ImagePackMozjpegSources::GEM_RUNTIME_C_SOURCES.map { |rel| File.join(mozjpeg_dir, rel) }
@@ -28,6 +28,8 @@ Gem::Specification.new do |spec|
     "#{mozjpeg_dir}/simd/nasm/jsimdcfg.inc.h",
     "#{mozjpeg_dir}/win/*.inc"
   ]
+
+  jpegli_runtime_files = []
 
   spec.files = (
     Dir["lib/**/*.rb"] +
@@ -42,7 +44,8 @@ Gem::Specification.new do |spec|
       CHANGELOG.md
     ] +
     mozjpeg_runtime_sources +
-    mozjpeg_support_files
+    mozjpeg_support_files +
+    jpegli_runtime_files
   ).select { |path| File.file?(path) }.uniq.sort
 
   spec.bindir        = "exe"

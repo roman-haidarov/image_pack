@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # Native hot-path sample for:
-#   ImagePack.compress(bytes, algo: :mozjpeg, quality: 82, mozjpeg_trellis: ENV.fetch("MOZJPEG_TRELLIS", "1") != "0")
+#   ImagePack.compress(bytes, engine: :mozjpeg, quality: 82, mozjpeg_trellis: ENV.fetch("MOZJPEG_TRELLIS", "1") != "0")
 #
 # Run without arguments:
 #   bundle exec ruby samples/mozjpeg_compress_hot_path.rb
@@ -16,7 +16,7 @@ $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 require "image_pack"
 
 input_path = ARGV[0] || (File.file?("tmp/cosmos.jpeg") ? "tmp/cosmos.jpeg" : "/tmp/cosmos.jpeg")
-algo = :mozjpeg
+engine = :mozjpeg
 quality = 82
 mozjpeg_trellis = ENV.fetch("MOZJPEG_TRELLIS", "1") != "0"
 sleep_before_hot_loop = 7.0
@@ -60,7 +60,7 @@ def jpeg_bytes!(out, label)
 end
 
 preheat_iterations.times do
-  out = ImagePack.compress(bytes, algo: algo, quality: quality, mozjpeg_trellis: mozjpeg_trellis)
+  out = ImagePack.compress(bytes, engine: engine, quality: quality, mozjpeg_trellis: mozjpeg_trellis)
   jpeg_bytes!(out, "preheat")
 end
 
@@ -75,8 +75,8 @@ puts "platform=#{RUBY_PLATFORM}"
 puts "mode=#{sample_name}"
 puts "input_path=#{input_path}"
 puts "input_bytes=#{bytes.bytesize}"
-puts "call=ImagePack.compress(bytes, algo: :#{algo}, quality: #{quality}, mozjpeg_trellis: #{mozjpeg_trellis})"
-puts "algo=#{algo}"
+puts "call=ImagePack.compress(bytes, engine: :#{engine}, quality: #{quality}, mozjpeg_trellis: #{mozjpeg_trellis})"
+puts "engine=#{engine}"
 puts "quality=#{quality}"
 puts "mozjpeg_trellis=#{mozjpeg_trellis}"
 puts "duration=#{duration}"
@@ -114,7 +114,7 @@ begin
   last_output = nil
 
   while monotonic < deadline
-    last_output = ImagePack.compress(bytes, algo: algo, quality: quality, mozjpeg_trellis: mozjpeg_trellis)
+    last_output = ImagePack.compress(bytes, engine: engine, quality: quality, mozjpeg_trellis: mozjpeg_trellis)
     first_output_bytes ||= last_output.bytesize
     count += 1
   end

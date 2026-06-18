@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # Native hot-path sample for the SSIM-guarded compression path:
-#   ImagePack.compress(bytes, algo: :jpeg_turbo, min_ssim: 0.985)
+#   ImagePack.compress(bytes, engine: :turbo, min_ssim: 0.985)
 #
 # Run without arguments:
 #   bundle exec ruby samples/ssim_guarded_compress_hot_path.rb
@@ -10,7 +10,7 @@
 #   tmp/cosmos.jpeg if present, otherwise /tmp/cosmos.jpeg
 #
 # Optional env:
-#   ALGO=mozjpeg MIN_SSIM=0.985 QUALITY=75 DURATION=25 PREHEAT_ITERATIONS=1 \
+#   ENGINE=mozjpeg MIN_SSIM=0.985 QUALITY=75 DURATION=25 PREHEAT_ITERATIONS=1 \
 #     bundle exec ruby samples/ssim_guarded_compress_hot_path.rb photo.jpg
 #
 # QUALITY is intentionally optional:
@@ -24,7 +24,7 @@ $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 require "image_pack"
 
 input_path = ARGV[0] || (File.file?("tmp/cosmos.jpeg") ? "tmp/cosmos.jpeg" : "/tmp/cosmos.jpeg")
-algo = ENV.fetch("ALGO", "jpeg_turbo").to_sym
+engine = ENV.fetch("ENGINE", "turbo").to_sym
 min_ssim = Float(ENV.fetch("MIN_SSIM", "0.985"))
 quality = ENV["QUALITY"]&.then { |value| Integer(value) }
 sleep_before_hot_loop = Float(ENV.fetch("SLEEP_BEFORE_HOT_LOOP", "7.0"))
@@ -67,23 +67,23 @@ def jpeg_bytes!(out, label)
   raise "#{label}: missing JPEG EOI marker" unless out.getbyte(out.bytesize - 2) == 0xFF && out.getbyte(out.bytesize - 1) == 0xD9
 end
 
-def compress_guarded(bytes, algo:, quality:, min_ssim:)
-  opts = { algo: algo, min_ssim: min_ssim }
+def compress_guarded(bytes, engine:, quality:, min_ssim:)
+  opts = { engine: engine, min_ssim: min_ssim }
   opts[:quality] = quality unless quality.nil?
 
   ImagePack.compress(bytes, **opts)
 end
 
-def call_description(algo, quality, min_ssim)
+def call_description(engine, quality, min_ssim)
   if quality.nil?
-    "ImagePack.compress(bytes, algo: :#{algo}, min_ssim: #{min_ssim})"
+    "ImagePack.compress(bytes, engine: :#{engine}, min_ssim: #{min_ssim})"
   else
-    "ImagePack.compress(bytes, algo: :#{algo}, quality: #{quality}, min_ssim: #{min_ssim})"
+    "ImagePack.compress(bytes, engine: :#{engine}, quality: #{quality}, min_ssim: #{min_ssim})"
   end
 end
 
 preheat_iterations.times do
-  out = compress_guarded(bytes, algo: algo, quality: quality, min_ssim: min_ssim)
+  out = compress_guarded(bytes, engine: engine, quality: quality, min_ssim: min_ssim)
   jpeg_bytes!(out, "preheat")
 end
 
@@ -98,8 +98,8 @@ puts "platform=#{RUBY_PLATFORM}"
 puts "mode=#{sample_name}"
 puts "input_path=#{input_path}"
 puts "input_bytes=#{bytes.bytesize}"
-puts "call=#{call_description(algo, quality, min_ssim)}"
-puts "algo=#{algo}"
+puts "call=#{call_description(engine, quality, min_ssim)}"
+puts "engine=#{engine}"
 puts "quality=#{quality.nil? ? 'auto' : quality}"
 puts "min_ssim=#{min_ssim}"
 puts "duration=#{duration}"
@@ -116,8 +116,8 @@ puts %(mkdir -p "#{txt_dir}"; OUT="#{txt_file}"; SAMPLE="#{sample_file}"; { samp
 puts
 puts "Expected hot native symbols:"
 puts "  ImagePack.compress -> __compress_jpeg"
-puts "  ip_compress_jpeg_entry / ip_jpeg_turbo_compress or ip_mozjpeg_compress"
-puts "  guarded_compress_jpeg_input_with_mode"
+puts "  ip_compress_jpeg_entry / ip_jpeg_turbo_compress, ip_mozjpeg_compress, or ip_jpegli_compress"
+puts "  guarded_compress_jpeg_input_with_encoder / guarded_compress_jpeg_input_with_mode"
 puts "  ip_jpeg_decode_to_pixels / encode_pixels_with_libjpeg"
 puts "  ip_build_luma_buffer"
 puts "  ip_compute_ssim_luma_buffer"
@@ -142,7 +142,7 @@ begin
   last_output = nil
 
   while monotonic < deadline
-    last_output = compress_guarded(bytes, algo: algo, quality: quality, min_ssim: min_ssim)
+    last_output = compress_guarded(bytes, engine: engine, quality: quality, min_ssim: min_ssim)
     first_output_bytes ||= last_output.bytesize
     count += 1
   end

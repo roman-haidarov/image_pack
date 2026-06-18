@@ -7,7 +7,7 @@ class TestReportAndStrict < Minitest::Test
   include ImagePackTestHelpers
 
   def big_jpeg
-    sample_jpeg(algo: :mozjpeg, quality: 90, width: 400, height: 400)
+    sample_jpeg(engine: :mozjpeg, quality: 90, width: 400, height: 400)
   end
 
   def truncated_jpeg(fraction: 0.6)
@@ -16,14 +16,14 @@ class TestReportAndStrict < Minitest::Test
   end
 
   def test_report_true_returns_hash_for_bytes_output
-    result = ImagePack.compress(big_jpeg, algo: :mozjpeg, quality: 70, report: true)
+    result = ImagePack.compress(big_jpeg, engine: :mozjpeg, quality: 70, report: true)
 
     assert_kind_of Hash, result
     assert_kind_of String, result[:output]
     assert_equal Encoding::ASCII_8BIT, result[:output].encoding
     assert_equal 70, result[:quality]
     assert_nil result[:ssim]
-    assert_equal :mozjpeg, result[:algo]
+    assert_equal :mozjpeg, result[:engine]
     assert_equal result[:output].bytesize, result[:bytesize]
     assert_operator result[:input_bytesize], :>, 0
     assert_equal 0, result[:warning_count]
@@ -31,7 +31,7 @@ class TestReportAndStrict < Minitest::Test
   end
 
   def test_report_true_exposes_ssim_selected_quality
-    result = ImagePack.compress(big_jpeg, algo: :mozjpeg, min_ssim: 0.97, report: true)
+    result = ImagePack.compress(big_jpeg, engine: :mozjpeg, min_ssim: 0.97, report: true)
 
     assert_kind_of Float, result[:ssim]
     assert_operator result[:ssim], :>=, 0.97
@@ -41,7 +41,7 @@ class TestReportAndStrict < Minitest::Test
   def test_report_true_for_file_output
     Dir.mktmpdir do |dir|
       path = File.join(dir, "out.jpg")
-      result = ImagePack.compress(big_jpeg, output: path, algo: :mozjpeg, quality: 75, report: true)
+      result = ImagePack.compress(big_jpeg, output: path, engine: :mozjpeg, quality: 75, report: true)
 
       assert_equal true, result[:output]
       assert_equal 75, result[:quality]
@@ -51,7 +51,7 @@ class TestReportAndStrict < Minitest::Test
   end
 
   def test_report_false_preserves_legacy_return
-    out = ImagePack.compress(big_jpeg, algo: :mozjpeg, quality: 70)
+    out = ImagePack.compress(big_jpeg, engine: :mozjpeg, quality: 70)
 
     assert_kind_of String, out
     assert_equal Encoding::ASCII_8BIT, out.encoding
@@ -60,11 +60,11 @@ class TestReportAndStrict < Minitest::Test
   def test_report_true_for_compress_pixels
     pixels = sample_pixels(width: 200, height: 160)
     result = ImagePack.compress_pixels(pixels, width: 200, height: 160, channels: 3,
-                                       algo: :mozjpeg, min_ssim: 0.95, report: true)
+                                       engine: :mozjpeg, min_ssim: 0.95, report: true)
 
     assert_kind_of Float, result[:ssim]
     assert_operator result[:ssim], :>=, 0.95
-    assert_equal :mozjpeg, result[:algo]
+    assert_equal :mozjpeg, result[:engine]
   end
 
   def test_report_must_be_boolean
@@ -74,7 +74,7 @@ class TestReportAndStrict < Minitest::Test
   end
 
   def test_warnings_collected_on_truncated_input
-    result = ImagePack.compress(truncated_jpeg, algo: :mozjpeg, report: true)
+    result = ImagePack.compress(truncated_jpeg, engine: :mozjpeg, report: true)
 
     assert_operator result[:warning_count], :>, 0
     assert_kind_of String, result[:warning]
@@ -82,12 +82,12 @@ class TestReportAndStrict < Minitest::Test
 
   def test_strict_rejects_truncated_input
     assert_raises(ImagePack::InvalidImageError) do
-      ImagePack.compress(truncated_jpeg, algo: :mozjpeg, strict: true)
+      ImagePack.compress(truncated_jpeg, engine: :mozjpeg, strict: true)
     end
   end
 
   def test_strict_accepts_clean_input
-    out = ImagePack.compress(big_jpeg, algo: :mozjpeg, strict: true)
+    out = ImagePack.compress(big_jpeg, engine: :mozjpeg, strict: true)
 
     assert_kind_of String, out
     assert_operator out.bytesize, :>, 0
@@ -111,7 +111,7 @@ class TestReportAndStrict < Minitest::Test
   end
 
   def test_cancellable_true_is_accepted_for_nogvl
-    out = ImagePack.compress(big_jpeg, algo: :mozjpeg, execution: :nogvl, cancellable: true)
+    out = ImagePack.compress(big_jpeg, engine: :mozjpeg, execution: :nogvl, cancellable: true)
 
     assert_kind_of String, out
   end
@@ -127,7 +127,7 @@ class TestReportAndStrict < Minitest::Test
     thread = Thread.new do
       Thread.current.report_on_exception = false
       ImagePack.compress_pixels(pixels, width: 2600, height: 2600, channels: 3,
-                                algo: :mozjpeg, execution: :nogvl, cancellable: true, min_ssim: 0.99)
+                                engine: :mozjpeg, execution: :nogvl, cancellable: true, min_ssim: 0.99)
       :completed
     rescue ImagePack::CancelledError
       :cancelled
@@ -145,7 +145,7 @@ class TestReportAndStrict < Minitest::Test
     skip "offload is available in this runtime" if ImagePack.offload_safe?
 
     error = assert_raises(ImagePack::UnsupportedError) do
-      ImagePack.compress(big_jpeg, execution: :offload)
+      ImagePack.compress(big_jpeg, engine: :mozjpeg, execution: :offload)
     end
 
     assert_match(/unavailable in this runtime/, error.message)
@@ -155,7 +155,7 @@ class TestReportAndStrict < Minitest::Test
   def test_offload_execution_when_runtime_supports_it
     skip "offload is unavailable in this runtime" unless ImagePack.offload_safe?
 
-    out = ImagePack.compress(big_jpeg, execution: :offload)
+    out = ImagePack.compress(big_jpeg, engine: :mozjpeg, execution: :offload)
 
     assert_jpeg(out)
   end

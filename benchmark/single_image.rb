@@ -8,7 +8,8 @@ abort "input image not found: #{path}" unless File.file?(path)
 bytes = File.binread(path)
 
 Benchmark.ips do |x|
-  x.report("jpeg_turbo") { ImagePack.compress(bytes, algo: :jpeg_turbo, quality: 82) }
-  x.report("mozjpeg") { ImagePack.compress(bytes, algo: :mozjpeg, quality: 82) }
+  x.report("jpegli") { ImagePack.compress(bytes, engine: :jpegli, quality: 82) } if ImagePack.jpegli_available?
+  x.report("turbo") { ImagePack.compress(bytes, engine: :turbo, quality: 82) }
+  x.report("mozjpeg") { ImagePack.compress(bytes, engine: :mozjpeg, quality: 82) }
   x.compare!
 end

@@ -5,13 +5,13 @@ require_relative "test_helper"
 class TestValidation < Minitest::Test
   include ImagePackTestHelpers
 
-  def test_rejects_unknown_algorithm
+  def test_rejects_unknown_engine
     assert_raises(ImagePack::InvalidArgumentError) do
       ImagePack.compress_pixels(sample_pixels,
                                 width: DEFAULT_WIDTH,
                                 height: DEFAULT_HEIGHT,
                                 channels: DEFAULT_CHANNELS,
-                                algo: :unknown)
+                                engine: :unknown)
     end
   end
 
@@ -31,7 +31,7 @@ class TestValidation < Minitest::Test
     [0.0, -0.1, 1.1, "0.985"].each do |min_ssim|
       assert_raises(ImagePack::InvalidArgumentError) do
         ImagePack.compress(sample_jpeg,
-                           algo: :jpeg_turbo,
+                           engine: :turbo,
                            min_ssim: min_ssim,
                            execution: :direct)
       end
@@ -121,7 +121,7 @@ class TestValidation < Minitest::Test
                                 width: 16,
                                 height: 16,
                                 channels: 3,
-                                algo: :jpeg_turbo,
+                                engine: :turbo,
                                 quality: 82,
                                 execution: :direct)
     end

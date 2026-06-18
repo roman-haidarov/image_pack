@@ -28,11 +28,12 @@ rescue LoadError
 end
 
 module ImagePack
-  ALGOS = %i[jpeg_turbo mozjpeg fast size].freeze
-  ALGO_TO_NATIVE = { jpeg_turbo: :jpeg_turbo, mozjpeg: :mozjpeg, fast: :jpeg_turbo, size: :mozjpeg }.freeze
+  ENGINES = %i[jpegli turbo mozjpeg].freeze
+  ENGINE_TO_NATIVE = { jpegli: :jpegli, turbo: :jpeg_turbo, mozjpeg: :mozjpeg }.freeze
   EXECUTION_MODES = %i[direct nogvl offload auto].freeze
   DEFAULT_QUALITY = 82
-  DEFAULT_ALGO = :mozjpeg
+  DEFAULT_ENGINE = :mozjpeg
+  EXPERIMENTAL_ENGINES = %i[jpegli].freeze
 
   class << self
     def configuration
@@ -50,6 +51,13 @@ module ImagePack
       {
         version: VERSION,
         mozjpeg: defined?(NATIVE_MOZJPEG_VERSION) ? NATIVE_MOZJPEG_VERSION : nil,
+        jpegli: {
+          binary: jpegli_binary_path,
+          available: jpegli_available?
+        },
+        engines: ENGINES,
+        default_engine: DEFAULT_ENGINE,
+        experimental_engines: EXPERIMENTAL_ENGINES,
         simd: defined?(NATIVE_SIMD) ? NATIVE_SIMD : nil,
         offload_safe: offload_safe?
       }
@@ -57,6 +65,27 @@ module ImagePack
 
     def offload_safe?
       defined?(NATIVE_OFFLOAD_SAFE) && NATIVE_OFFLOAD_SAFE == true
+    end
+
+    def jpegli_binary_path
+      configured = ENV["IMAGE_PACK_JPEGLI_BIN"]
+      if configured && !configured.empty?
+        return configured if configured.include?(File::SEPARATOR) && File.file?(configured) && File.executable?(configured)
+        return path_lookup(configured) unless configured.include?(File::SEPARATOR)
+
+        return nil
+      end
+
+      candidates = [
+        File.expand_path("../ext/image_pack/vendor/jpegli/bin/cjpegli", __dir__),
+        File.expand_path("../ext/image_pack/vendor/jpegli/tools/cjpegli", __dir__),
+        File.expand_path("../ext/image_pack/vendor/jpegli/cjpegli", __dir__)
+      ]
+      candidates.find { |path| File.file?(path) && File.executable?(path) } || path_lookup("cjpegli")
+    end
+
+    def jpegli_available?
+      !!jpegli_binary_path
     end
 
     def compress_bytes(bytes, **options)
@@ -117,7 +146,7 @@ module ImagePack
 
     def compress(input,
                  output: nil,
-                 algo: DEFAULT_ALGO,
+                 engine: nil,
                  quality: nil,
                  min_ssim: nil,
                  mozjpeg_trellis: true,
@@ -127,7 +156,7 @@ module ImagePack
                  cancellable: false,
                  report: false,
                  strict: false)
-      validate_algo!(algo)
+      engine = resolve_engine!(engine)
       validate_min_ssim!(min_ssim)
       validate_boolean!(:mozjpeg_trellis, mozjpeg_trellis)
       validate_boolean!(:progressive, progressive)
@@ -135,6 +164,7 @@ module ImagePack
       validate_boolean!(:cancellable, cancellable)
       validate_boolean!(:report, report)
       validate_boolean!(:strict, strict)
+      jpegli_bin = jpegli_binary_for!(engine, min_ssim)
       quality_was_given = !quality.nil?
       effective_quality = quality_was_given ? quality : DEFAULT_QUALITY
       effective_quality = 1 if min_ssim && !quality_was_given
@@ -142,7 +172,7 @@ module ImagePack
       execution ||= configuration.execution
       validate_execution!(execution)
       validate_execution_supported!(execution)
-      validate_cancellable!(algo, execution, cancellable)
+      validate_cancellable!(engine, execution, cancellable)
 
       normalized_input_kind = input_kind!(input)
       normalized_output_kind = output_kind!(output)
@@ -150,7 +180,7 @@ module ImagePack
 
       __compress_jpeg(input, normalized_input_kind,
                       output, normalized_output_kind,
-                      ALGO_TO_NATIVE.fetch(algo), effective_quality,
+                      ENGINE_TO_NATIVE.fetch(engine), effective_quality,
                       min_ssim ? min_ssim.to_f : 0.0,
                       mozjpeg_trellis ? 1 : 0,
                       progressive ? 1 : 0,
@@ -159,7 +189,8 @@ module ImagePack
                       cancellable ? 1 : 0,
                       has_scheduler ? 1 : 0,
                       report ? 1 : 0,
-                      strict ? 1 : 0)
+                      strict ? 1 : 0,
+                      jpegli_bin)
     end
 
     def compress_pixels(buffer,
@@ -167,7 +198,7 @@ module ImagePack
                         height:,
                         channels:,
                         output: nil,
-                        algo: DEFAULT_ALGO,
+                        engine: nil,
                         quality: nil,
                         min_ssim: nil,
                         mozjpeg_trellis: true,
@@ -179,7 +210,7 @@ module ImagePack
                         report: false,
                         strict: false)
       validate_pixel_buffer!(buffer)
-      validate_algo!(algo)
+      engine = resolve_engine!(engine)
       validate_min_ssim!(min_ssim)
       validate_boolean!(:mozjpeg_trellis, mozjpeg_trellis)
       validate_boolean!(:progressive, progressive)
@@ -188,6 +219,7 @@ module ImagePack
       validate_boolean!(:cancellable, cancellable)
       validate_boolean!(:report, report)
       validate_boolean!(:strict, strict)
+      jpegli_bin = jpegli_binary_for!(engine, min_ssim)
       quality_was_given = !quality.nil?
       effective_quality = quality_was_given ? quality : DEFAULT_QUALITY
       effective_quality = 1 if min_ssim && !quality_was_given
@@ -196,7 +228,7 @@ module ImagePack
       execution ||= configuration.execution
       validate_execution!(execution)
       validate_execution_supported!(execution)
-      validate_cancellable!(algo, execution, cancellable)
+      validate_cancellable!(engine, execution, cancellable)
 
       if channels == 4
         case drop_alpha
@@ -220,7 +252,7 @@ module ImagePack
       __compress_pixels(buffer,
                         width, height, channels,
                         output, normalized_output_kind,
-                        ALGO_TO_NATIVE.fetch(algo), effective_quality,
+                        ENGINE_TO_NATIVE.fetch(engine), effective_quality,
                         min_ssim ? min_ssim.to_f : 0.0,
                         mozjpeg_trellis ? 1 : 0,
                         progressive ? 1 : 0,
@@ -229,7 +261,8 @@ module ImagePack
                         cancellable ? 1 : 0,
                         has_scheduler ? 1 : 0,
                         report ? 1 : 0,
-                        strict ? 1 : 0)
+                        strict ? 1 : 0,
+                        jpegli_bin)
     end
 
     def inspect_image(input)
@@ -237,6 +270,37 @@ module ImagePack
     end
 
     private
+
+    def path_lookup(command)
+      ENV["PATH"].to_s.split(File::PATH_SEPARATOR).each do |dir|
+        path = File.join(dir, command)
+        return path if File.file?(path) && File.executable?(path)
+      end
+      nil
+    end
+
+    def resolve_engine!(engine)
+      engine = DEFAULT_ENGINE if engine.nil?
+      validate_engine!(engine)
+      engine
+    end
+
+    def jpegli_binary_for!(engine, min_ssim)
+      return nil unless engine == :jpegli
+
+      if min_ssim
+        raise UnsupportedError,
+              "min_ssim is not supported with engine: :jpegli; use engine: :turbo or :mozjpeg"
+      end
+
+      path = jpegli_binary_path
+      unless path
+        raise UnsupportedError,
+              "engine: :jpegli requires the cjpegli helper, which was not found. " \
+              "Install it and set IMAGE_PACK_JPEGLI_BIN, or use engine: :turbo or :mozjpeg."
+      end
+      path
+    end
 
     def input_kind!(input)
       case input
@@ -269,10 +333,10 @@ module ImagePack
       raise InvalidArgumentError, "output must be nil, String path, or Pathname"
     end
 
-    def validate_algo!(algo)
-      return if ALGOS.include?(algo)
+    def validate_engine!(engine)
+      return if ENGINES.include?(engine)
 
-      raise InvalidArgumentError, "algo must be one of #{ALGOS}, got: #{algo.inspect}"
+      raise InvalidArgumentError, "engine must be one of #{ENGINES}, got: #{engine.inspect}"
     end
 
     def validate_quality!(quality)
@@ -327,8 +391,13 @@ module ImagePack
       raise InvalidArgumentError, "pixel buffer must be a String or IO::Buffer"
     end
 
-    def validate_cancellable!(_algo, execution, cancellable)
+    def validate_cancellable!(engine, execution, cancellable)
       return unless cancellable
+
+      if engine == :jpegli
+        raise UnsupportedError, "cancellable: true is not supported with engine: :jpegli"
+      end
+
       return unless execution == :direct
 
       raise InvalidArgumentError,

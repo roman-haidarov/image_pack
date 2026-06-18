@@ -1,10 +1,10 @@
 # frozen_string_literal: true
 
 # Native hot-path sample for:
-#   ImagePack.compress(bytes, algo: :jpeg_turbo, quality: 82)
+#   ImagePack.compress(bytes, engine: :turbo, quality: 82)
 #
 # Run without arguments:
-#   bundle exec ruby samples/jpeg_turbo_compress_hot_path.rb
+#   bundle exec ruby samples/turbo_compress_hot_path.rb
 #
 # Default input:
 #   tmp/cosmos.jpeg if present, otherwise /tmp/cosmos.jpeg
@@ -16,16 +16,16 @@ $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 require "image_pack"
 
 input_path = ARGV[0] || (File.file?("tmp/cosmos.jpeg") ? "tmp/cosmos.jpeg" : "/tmp/cosmos.jpeg")
-algo = :jpeg_turbo
+engine = :turbo
 quality = 82
 sleep_before_hot_loop = 7.0
 duration = 25.0
 preheat_iterations = 3
-sample_name = "image_pack_jpeg_turbo_compress_hot_path"
+sample_name = "image_pack_turbo_compress_hot_path"
 native_grep = "ImagePack|image_pack|ip_|jpeg_|jinit_|jcopy_|jzero_|jsimd_|huff|dct|jcap|jdat|jdap|jdcoef|jccoef|jchuff|jdhuff|jfdct|jidct|jmem|jutils"
 
 unless File.file?(input_path)
-  abort "input image not found: #{input_path}\nput example image here: tmp/cosmos.jpeg or /tmp/cosmos.jpeg\nor pass path explicitly: bundle exec ruby samples/jpeg_turbo_compress_hot_path.rb photo.jpg"
+  abort "input image not found: #{input_path}\nput example image here: tmp/cosmos.jpeg or /tmp/cosmos.jpeg\nor pass path explicitly: bundle exec ruby samples/turbo_compress_hot_path.rb photo.jpg"
 end
 
 bytes = File.binread(input_path).b.freeze
@@ -59,7 +59,7 @@ def jpeg_bytes!(out, label)
 end
 
 preheat_iterations.times do
-  out = ImagePack.compress(bytes, algo: algo, quality: quality)
+  out = ImagePack.compress(bytes, engine: engine, quality: quality)
   jpeg_bytes!(out, "preheat")
 end
 
@@ -74,8 +74,8 @@ puts "platform=#{RUBY_PLATFORM}"
 puts "mode=#{sample_name}"
 puts "input_path=#{input_path}"
 puts "input_bytes=#{bytes.bytesize}"
-puts "call=ImagePack.compress(bytes, algo: :#{algo}, quality: #{quality})"
-puts "algo=#{algo}"
+puts "call=ImagePack.compress(bytes, engine: :#{engine}, quality: #{quality})"
+puts "engine=#{engine}"
 puts "quality=#{quality}"
 puts "duration=#{duration}"
 puts "preheat_iterations=#{preheat_iterations}"
@@ -110,7 +110,7 @@ begin
   last_output = nil
 
   while monotonic < deadline
-    last_output = ImagePack.compress(bytes, algo: algo, quality: quality)
+    last_output = ImagePack.compress(bytes, engine: engine, quality: quality)
     first_output_bytes ||= last_output.bytesize
     count += 1
   end

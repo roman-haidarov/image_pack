@@ -11,13 +11,13 @@ end
 
 before = rss_kb
 bytes = File.binread(path)
-ImagePack.compress(bytes, algo: :jpeg_turbo)
+ImagePack.compress(bytes, engine: :turbo)
 after_string = rss_kb
 
 if defined?(IO::Buffer)
   File.open(path, "rb") do |file|
     buffer = IO::Buffer.map(file)
-    ImagePack.compress(buffer, algo: :jpeg_turbo)
+    ImagePack.compress(buffer, engine: :turbo)
   end
 end
 after_buffer = rss_kb

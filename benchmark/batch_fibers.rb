@@ -14,7 +14,7 @@ Async do |task|
   fibers.times do
     task.async do
       iterations.times do
-        ImagePack.compress(bytes, algo: :mozjpeg, quality: 82, execution: :auto)
+        ImagePack.compress(bytes, engine: :mozjpeg, quality: 82, execution: :auto)
       end
     end
   end

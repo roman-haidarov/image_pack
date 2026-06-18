@@ -5,11 +5,11 @@ require_relative "test_helper"
 class TestJpegQuality < Minitest::Test
   include ImagePackTestHelpers
 
-  def test_jpeg_input_quality_changes_jpeg_turbo_output_size
-    input = sample_jpeg(algo: :jpeg_turbo, quality: 90, width: 128, height: 96)
+  def test_jpeg_input_quality_changes_turbo_output_size
+    input = sample_jpeg(engine: :turbo, quality: 90, width: 128, height: 96)
 
-    low = ImagePack.compress(input, algo: :jpeg_turbo, quality: 20, execution: :nogvl)
-    high = ImagePack.compress(input, algo: :jpeg_turbo, quality: 95, execution: :nogvl)
+    low = ImagePack.compress(input, engine: :turbo, quality: 20, execution: :nogvl)
+    high = ImagePack.compress(input, engine: :turbo, quality: 95, execution: :nogvl)
 
     assert_jpeg low
     assert_jpeg high
@@ -18,10 +18,10 @@ class TestJpegQuality < Minitest::Test
   end
 
   def test_jpeg_input_quality_changes_mozjpeg_output_size
-    input = sample_jpeg(algo: :jpeg_turbo, quality: 90, width: 128, height: 96)
+    input = sample_jpeg(engine: :turbo, quality: 90, width: 128, height: 96)
 
-    low = ImagePack.compress(input, algo: :mozjpeg, quality: 20, execution: :nogvl)
-    high = ImagePack.compress(input, algo: :mozjpeg, quality: 95, execution: :nogvl)
+    low = ImagePack.compress(input, engine: :mozjpeg, quality: 20, execution: :nogvl)
+    high = ImagePack.compress(input, engine: :mozjpeg, quality: 95, execution: :nogvl)
 
     assert_jpeg low
     assert_jpeg high
@@ -29,13 +29,13 @@ class TestJpegQuality < Minitest::Test
     assert_operator low.bytesize, :<, high.bytesize
   end
 
-  def test_pixel_input_quality_changes_jpeg_turbo_output_size
+  def test_pixel_input_quality_changes_turbo_output_size
     pixels = sample_pixels(width: 128, height: 96)
 
     low = ImagePack.compress_pixels(pixels, width: 128, height: 96, channels: 3,
-                                    algo: :jpeg_turbo, quality: 20, execution: :direct)
+                                    engine: :turbo, quality: 20, execution: :direct)
     high = ImagePack.compress_pixels(pixels, width: 128, height: 96, channels: 3,
-                                     algo: :jpeg_turbo, quality: 95, execution: :direct)
+                                     engine: :turbo, quality: 95, execution: :direct)
 
     assert_jpeg low
     assert_jpeg high
@@ -43,19 +43,19 @@ class TestJpegQuality < Minitest::Test
   end
 
   def test_min_ssim_guard_returns_valid_jpeg
-    input = sample_jpeg(algo: :jpeg_turbo, quality: 90, width: 128, height: 96)
+    input = sample_jpeg(engine: :turbo, quality: 90, width: 128, height: 96)
 
-    out = ImagePack.compress(input, algo: :jpeg_turbo, min_ssim: 0.985, execution: :direct)
+    out = ImagePack.compress(input, engine: :turbo, min_ssim: 0.985, execution: :direct)
 
     assert_jpeg out
   end
 
   def test_min_ssim_guard_raises_quality_above_low_start
-    input = sample_jpeg(algo: :jpeg_turbo, quality: 90, width: 128, height: 96)
+    input = sample_jpeg(engine: :turbo, quality: 90, width: 128, height: 96)
 
-    low = ImagePack.compress(input, algo: :jpeg_turbo, quality: 20, execution: :direct)
+    low = ImagePack.compress(input, engine: :turbo, quality: 20, execution: :direct)
     guarded = ImagePack.compress(input,
-                                  algo: :jpeg_turbo,
+                                  engine: :turbo,
                                   quality: 20,
                                   min_ssim: 0.995,
                                   execution: :direct)
@@ -70,14 +70,14 @@ class TestJpegQuality < Minitest::Test
                                               width: 128,
                                               height: 96,
                                               channels: 3,
-                                              algo: :jpeg_turbo,
+                                              engine: :turbo,
                                               min_ssim: 0.10,
                                               execution: :direct)
     explicit_low = ImagePack.compress_pixels(pixels,
                                              width: 128,
                                              height: 96,
                                              channels: 3,
-                                             algo: :jpeg_turbo,
+                                             engine: :turbo,
                                              quality: 1,
                                              min_ssim: 0.10,
                                              execution: :direct)
@@ -94,7 +94,7 @@ class TestJpegQuality < Minitest::Test
                                     width: 96,
                                     height: 80,
                                     channels: 3,
-                                    algo: :mozjpeg,
+                                    engine: :mozjpeg,
                                     mozjpeg_trellis: false,
                                     quality: 82,
                                     execution: :direct)

@@ -16,6 +16,7 @@ module ImagePack
     ].freeze
 
     attr_reader :execution,
+                :fallback_engine,
                 :direct_input_threshold,
                 :direct_pixel_threshold,
                 :max_pixels,
@@ -26,6 +27,7 @@ module ImagePack
 
     def initialize
       @execution              = :auto
+      @fallback_engine        = :mozjpeg
       @direct_input_threshold = 128 * 1024
       @direct_pixel_threshold = 1 * 1024 * 1024
       @max_pixels             = 100_000_000
@@ -46,6 +48,15 @@ module ImagePack
       end
 
       @execution = value
+    end
+
+    def fallback_engine=(value)
+      allowed = %i[turbo mozjpeg]
+      unless allowed.include?(value)
+        raise InvalidArgumentError, "fallback_engine must be one of #{allowed}, got: #{value.inspect}"
+      end
+
+      @fallback_engine = value
     end
 
     SIZE_ATTRIBUTES.each do |name|

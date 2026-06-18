@@ -25,7 +25,7 @@ def generated_fixture
     width: width,
     height: height,
     channels: 3,
-    algo: :jpeg_turbo,
+    engine: :turbo,
     quality: 95
   )
 end
@@ -77,12 +77,12 @@ warn "benchmark input: #{width}x#{height}, #{bytes.bytesize} bytes, q=#{quality}
 
 candidates = []
 
-candidate("image_pack jpeg_turbo", candidates) do
-  ImagePack.compress(bytes, algo: :jpeg_turbo, quality: quality)
+candidate("image_pack turbo", candidates) do
+  ImagePack.compress(bytes, engine: :turbo, quality: quality)
 end
 
 candidate("image_pack mozjpeg", candidates) do
-  ImagePack.compress(bytes, algo: :mozjpeg, quality: quality)
+  ImagePack.compress(bytes, engine: :mozjpeg, quality: quality)
 end
 
 begin
