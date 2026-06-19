@@ -31,3 +31,23 @@ task console: :compile do
   ARGV.clear
   IRB.start
 end
+
+namespace :simd do
+  desc "Verify that the native extension was built with SIMD enabled"
+  task check: :compile do
+    require_relative "lib/image_pack"
+
+    if ImagePack.build_info[:simd]
+      puts "image_pack: SIMD enabled"
+    elsif ENV["IMAGE_PACK_ALLOW_SCALAR"] == "1"
+      warn "image_pack: scalar build allowed by IMAGE_PACK_ALLOW_SCALAR=1"
+    else
+      abort "image_pack: scalar build detected. Install nasm/yasm or set IMAGE_PACK_ALLOW_SCALAR=1."
+    end
+  end
+end
+
+namespace :release do
+  desc "Run release checks"
+  task check: ["simd:check", :test]
+end

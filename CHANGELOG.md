@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.5
+
+**Output and API changes (upgrade notes)**
+
+- `algo: :mozjpeg` and `algo: :size` now default to **progressive JPEG** with full scan optimization. Previously the default was baseline JPEG. Pass `progressive: false` to restore the old behavior.
+- Added `mozjpeg_scan_opt:` keyword to `compress` and `compress_pixels` (default `true`). Passing `false` keeps trellis + progressive + Huffman optimization but skips the multi-pass scan search, trading ~0.7% larger files for ~30% faster encode on the MozJPEG path.
+- `algo: :jpeg_turbo` and `algo: :fast` are unchanged: baseline JPEG, same output as 0.2.4.
+
+**Performance improvements**
+
+- SSIM guard (`min_ssim:`) now uses an interpolation/secant probe instead of pure bisection. Once a failing and a passing sample are known, the crossing quality is predicted by linear interpolation and clamped inside the live bracket. The accept/reject invariant and the minimal passing quality are unchanged; typical inputs converge in fewer encode/decode/SSIM round trips.
+- In size mode, the SSIM guard scores candidates with a cheap "measurement" encode that skips `OPTIMIZE_SCANS` (which only affects entropy coding/scan layout, never the dequantized coefficients). The winning quality is re-encoded once with the full profile, and the true SSIM of the final output is re-checked, so `report[:ssim] >= min_ssim` continues to hold.
+- The `algo: :jpeg_turbo`/`:fast` JPEG→JPEG path now transcodes through YCbCr instead of RGB, skipping one color-space round trip. Grayscale and `compress_pixels` inputs are unaffected.
+
+**Other**
+
+- Added stricter smoke coverage for legacy aliases, default algorithm behavior, and parser-backed JPEG assertions.
+- Added `rake simd:check` and `rake release:check` so release builds cannot silently ship scalar x86_64 output unless `IMAGE_PACK_ALLOW_SCALAR=1` is set.
+
 ## 0.2.4
 
 - libjpeg/MozJPEG diagnostics are no longer written to `stderr`; instead decode warnings (e.g. "Premature end of JPEG file") are counted and the first message is captured, so a damaged or truncated input is observable rather than silently degraded.

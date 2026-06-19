@@ -42,9 +42,6 @@ module ImagePackTestHelpers
     assert_instance_of String, bytes
     assert_equal Encoding::BINARY, bytes.encoding
     assert_operator bytes.bytesize, :>, 16
-    assert_equal 0xff, bytes.getbyte(0)
-    assert_equal 0xd8, bytes.getbyte(1)
-    assert_equal 0xff, bytes.getbyte(bytes.bytesize - 2)
-    assert_equal 0xd9, bytes.getbyte(bytes.bytesize - 1)
+    assert_equal :jpeg, ImagePack.inspect_image(bytes)[:format]
   end
 end
