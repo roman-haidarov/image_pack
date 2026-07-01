@@ -11,11 +11,11 @@ Gem::Specification.new do |spec|
 
   spec.summary       = "Ruby-native pure-C JPEG runtime: MozJPEG/libjpeg"
   spec.description   = "Single API, vendored pure-C MozJPEG/libjpeg codec, in-memory compression and atomic file output, " \
-                       "Ruby 3.1+ native JPEG execution; Ruby 3.4+ enables Fiber::Scheduler-aware offload. " \
+                       "Ruby 2.7.1+ native JPEG execution; Ruby 3.4+ enables Fiber::Scheduler-aware offload. " \
                        "Ships vendored C sources — no system libjpeg, git, or CMake required."
   spec.homepage      = "https://github.com/roman-haidarov/image_pack"
   spec.license       = "MIT"
-  spec.required_ruby_version = ">= 3.1.0"
+  spec.required_ruby_version = ">= 2.7.1"
 
   spec.metadata["homepage_uri"]    = spec.homepage
   spec.metadata["source_code_uri"] = spec.homepage
@@ -53,6 +53,4 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "rake", "~> 13.0"
   spec.add_development_dependency "rake-compiler", "~> 1.2"
   spec.add_development_dependency "minitest", "~> 5.0"
-  spec.add_development_dependency "benchmark-ips", "~> 2.13"
-  spec.add_development_dependency "async", "~> 2.21"
 end

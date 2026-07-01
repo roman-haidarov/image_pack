@@ -8,7 +8,8 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
-
+    env:
+      BUNDLE_WITH: modern_development
     strategy:
       fail-fast: false
       matrix:

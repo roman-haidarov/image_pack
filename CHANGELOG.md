@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.6
+
+- Lowered the supported Ruby floor to `>= 2.7.1`. The core JPEG API, vendored MozJPEG build, `:direct`, and `:nogvl` execution modes work on Ruby 2.7.1.
+- Kept `execution: :offload` explicitly unavailable until Ruby `>= 3.4`; `:auto` falls back to existing direct/no-GVL execution on older Rubies.
+- Moved Async, benchmark, and external-comparison tooling into an optional `modern_development` Bundler group so a Ruby 2.7.1 developer can install, compile, and run the core suite without resolving modern-only development gems.
+- CI enables `modern_development` on supported modern Rubies, so Async and benchmark dependencies remain covered there.
+
 ## 0.2.5
 
 **Output and API changes (upgrade notes)**

@@ -56,6 +56,20 @@ class TestValidation < Minitest::Test
     end
   end
 
+  def test_auto_execution_works_when_offload_is_not_available
+    skip "offload is available in this runtime" if ImagePack.offload_safe?
+
+    out = ImagePack.compress_pixels(sample_pixels,
+                                    width: DEFAULT_WIDTH,
+                                    height: DEFAULT_HEIGHT,
+                                    channels: DEFAULT_CHANNELS,
+                                    algo: :mozjpeg,
+                                    quality: 82,
+                                    execution: :auto)
+
+    assert_jpeg out
+  end
+
   def test_build_info_reports_offload_capability
     assert_includes [true, false], ImagePack.offload_safe?
     assert_equal ImagePack.offload_safe?, ImagePack.build_info[:offload_safe]
