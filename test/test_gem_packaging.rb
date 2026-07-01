@@ -22,6 +22,10 @@ class TestGemPackaging < Minitest::Test
     tjunittest.c
   ].freeze
 
+  def test_gemspec_declares_ruby_2_7_1_as_the_minimum_runtime
+    assert_equal Gem::Requirement.new(">= 2.7.1"), gemspec.required_ruby_version
+  end
+
   def test_gemspec_packages_single_source_of_truth_and_runtime_c_files
     spec = gemspec
 

@@ -156,10 +156,24 @@ end
 
 ## Development
 
+Core build and test dependencies work on Ruby 2.7.1+:
+
 ```bash
-bundle exec rake vendor
+bundle install
 bundle exec rake compile
 bundle exec rake test
+```
+
+Optional comparison benchmarks and Async tooling are kept out of Ruby 2.7 dependency resolution. Enable them on modern Ruby when needed:
+
+```bash
+BUNDLE_WITH=modern_development bundle install
+```
+
+Vendoring and release checks:
+
+```bash
+bundle exec rake vendor
 bundle exec rake release:check
 ```
 
@@ -170,7 +184,7 @@ bundle exec rake release:check
 ## Limits
 
 - JPEG only.
-- Ruby `>= 3.1`; `execution: :offload` requires Ruby `>= 3.4`.
+- Ruby `>= 2.7.1`; `execution: :offload` requires Ruby `>= 3.4`. On Ruby 2.7–3.3, `:auto` uses `:direct` or `:nogvl`; it never attempts scheduler offload.
 - Pixel-level `compress` rejects CMYK/YCCK JPEG input; use `optimize_jpeg` for existing CMYK/YCCK JPEGs.
 - Arithmetic-coded JPEG support is disabled in `0.2.5`.
 - Streaming output is not supported; file output uses atomic write-through-temp-file and rename.

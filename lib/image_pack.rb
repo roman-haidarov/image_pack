@@ -1,11 +1,11 @@
 # frozen_string_literal: true
 
-required = Gem::Version.new("3.1.0")
+required = Gem::Version.new("2.7.1")
 current  = Gem::Version.new(RUBY_VERSION)
 
 if current < required
   raise LoadError,
-        "image_pack requires Ruby >= 3.1.0, got #{RUBY_VERSION}. " \
+        "image_pack requires Ruby >= 2.7.1, got #{RUBY_VERSION}. " \
         "Ruby >= 3.4.0 is required only for execution: :offload."
 end
 

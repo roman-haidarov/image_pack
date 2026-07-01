@@ -4,8 +4,8 @@ require "mkmf"
 require "fileutils"
 require "rbconfig"
 
-if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.1.0")
-  abort "image_pack requires Ruby >= 3.1.0; got #{RUBY_VERSION}"
+if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("2.7.1")
+  abort "image_pack requires Ruby >= 2.7.1; got #{RUBY_VERSION}"
 end
 
 require_relative "mozjpeg_sources"
