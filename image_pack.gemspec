@@ -24,10 +24,14 @@ Gem::Specification.new do |spec|
   mozjpeg_dir = "ext/image_pack/vendor/mozjpeg"
   mozjpeg_runtime_sources = ImagePackMozjpegSources::GEM_RUNTIME_C_SOURCES.map { |rel| File.join(mozjpeg_dir, rel) }
   mozjpeg_support_files = Dir[
-    "#{mozjpeg_dir}/**/*.{h,h.in,inc,asm,S,in,txt,md}",
-    "#{mozjpeg_dir}/simd/nasm/jsimdcfg.inc.h",
+    "#{mozjpeg_dir}/*.{h,h.in,inc,txt,md}",
+    "#{mozjpeg_dir}/simd/jsimd.h",
+    "#{mozjpeg_dir}/simd/nasm/**/*.{h,inc,in}",
+    "#{mozjpeg_dir}/simd/x86_64/**/*.{h,asm}",
+    "#{mozjpeg_dir}/simd/arm/**/*.{h,in}",
+    "#{mozjpeg_dir}/simd/arm/aarch64/**/*.{h,c}",
     "#{mozjpeg_dir}/win/*.inc"
-  ]
+  ].reject { |path| path.include?("/aarch32/") }
 
   spec.files = (
     Dir["lib/**/*.rb"] +

@@ -71,6 +71,7 @@ module ImagePackMozjpegSources
     jutils.c
     jmemmgr.c
     jmemnobs.c
+    transupp.c
   ].freeze
 
   # MozJPEG/libjpeg-turbo uses these top-level .c files as textual include
@@ -166,6 +167,10 @@ module ImagePackMozjpegSources
 
     if relative_path.include?("/")
       return false unless relative_path.start_with?("simd/")
+      return false if relative_path.start_with?("simd/i386/", "simd/mips/", "simd/mips64/",
+                                                "simd/powerpc/", "simd/arm/aarch32/")
+      return false unless relative_path.start_with?("simd/arm/", "simd/x86_64/", "simd/nasm/") ||
+                          relative_path == "simd/jsimd.h"
 
       return SIMD_EXTENSIONS.include?(File.extname(relative_path))
     end

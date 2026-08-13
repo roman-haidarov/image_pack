@@ -25,6 +25,7 @@
 #endif
 #include <jpeglib.h>
 #include <jconfigint.h>
+#include <transupp.h>
 
 #ifndef IMAGE_PACK_INIT_EXPORT
 #if defined(_WIN32)
@@ -82,6 +83,21 @@
 
 #define IP_ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
+#define IP_MAX_MARKERS         64
+#define IP_MAX_PROFILE_MARKERS 256
+#define IP_MAX_MARKER_BYTES    (8u * 1024 * 1024)
+#define IP_MAX_ICC_BYTES       (4u * 1024 * 1024)
+#define IP_AUTO_444_QUALITY    90
+
+typedef enum {
+    IP_SUBSAMP_AUTO = 0,
+    IP_SUBSAMP_420 = 1,
+    IP_SUBSAMP_422 = 2,
+    IP_SUBSAMP_444 = 3
+} ip_subsamp_t;
+typedef enum { IP_TUNE_HVS = 0, IP_TUNE_SSIM = 1, IP_TUNE_MS_SSIM = 2, IP_TUNE_PSNR = 3 } ip_tune_t;
+typedef enum { IP_EFFORT_DEFAULT = 0, IP_EFFORT_FAST = 1, IP_EFFORT_MAX = 2 } ip_effort_t;
+
 typedef enum { IP_ALGO_JPEG_TURBO = 1, IP_ALGO_MOZJPEG = 2 } ip_algo_t;
 
 typedef enum {
@@ -136,6 +152,19 @@ typedef struct {
     int selected_quality;
     int progressive;
     int strip_metadata;
+    int strip_icc;
+    int trim_partial_mcus;
+    int subsampling;
+    int subsampling_active;
+    int tune;
+    int effort;
+    unsigned int scale_num;
+    unsigned int scale_denom;
+    unsigned char *icc_profile;
+    unsigned int icc_len;
+    size_t preserved_marker_bytes;
+    size_t preserved_misc_marker_count;
+    size_t preserved_profile_marker_count;
     int mozjpeg_trellis_enabled;
     int mozjpeg_scan_opt_enabled;
     ip_algo_t algo;
@@ -262,24 +291,38 @@ static int ip_jpeg_turbo_compress(ip_context_t *ctx);
 static int ip_mozjpeg_compress(ip_context_t *ctx);
 static int ip_lossless_optimize_jpeg(ip_context_t *ctx);
 static int ip_run_optimize_context(ip_context_t *ctx);
+static void configure_mozjpeg_profile_before_defaults(struct jpeg_compress_struct *cinfo,
+                                                      int mozjpeg_size_mode);
+static void configure_mozjpeg_features_after_defaults(struct jpeg_compress_struct *cinfo,
+                                                      const ip_context_t *ctx,
+                                                      int mozjpeg_size_mode, int measurement);
+static void ip_configure_encoder(struct jpeg_compress_struct *cinfo, ip_context_t *ctx,
+                                 int mozjpeg_size_mode, int measurement);
+static void ip_setup_marker_saving(struct jpeg_decompress_struct *cinfo, const ip_context_t *ctx);
+static int ip_scan_jpeg_marker_budget(ip_context_t *ctx);
+static int ip_capture_icc(ip_context_t *ctx, struct jpeg_decompress_struct *cinfo);
+static void ip_write_sidecar_metadata(ip_context_t *ctx, struct jpeg_compress_struct *cinfo);
+static int ip_open_source_jpeg(ip_context_t *ctx, struct jpeg_decompress_struct *cinfo);
+static int ip_ingest_source_metadata(ip_context_t *ctx, struct jpeg_decompress_struct *cinfo);
 
 typedef struct {
     VALUE self, input, input_kind, output, output_kind, algo, quality, min_ssim;
     VALUE mozjpeg_trellis, progressive, strip_metadata, execution, cancellable, has_scheduler;
-    VALUE report, strict, mozjpeg_scan_opt;
+    VALUE report, strict, mozjpeg_scan_opt, strip_icc, subsampling, tune, effort;
+    VALUE scale_num, scale_denom;
     ip_context_t *ctx;
 } ip_compress_jpeg_call_t;
 
 typedef struct {
     VALUE self, buffer, width, height, channels, output, output_kind, algo, quality, min_ssim;
     VALUE mozjpeg_trellis, progressive, exact_size, execution, cancellable, has_scheduler;
-    VALUE report, strict, mozjpeg_scan_opt;
+    VALUE report, strict, mozjpeg_scan_opt, subsampling, tune, effort;
     ip_context_t *ctx;
 } ip_compress_pixels_call_t;
 
 typedef struct {
     VALUE self, input, input_kind, output, output_kind, progressive, strip_metadata;
-    VALUE execution, cancellable, has_scheduler, strict;
+    VALUE execution, cancellable, has_scheduler, strict, strip_icc, trim;
     ip_context_t *ctx;
 } ip_optimize_jpeg_call_t;
 
@@ -302,7 +345,7 @@ static VALUE ip_compress_pixels_entry(int argc, VALUE *argv, VALUE self);
 static VALUE ip_optimize_jpeg_entry(VALUE self, VALUE input, VALUE input_kind, VALUE output,
                                     VALUE output_kind, VALUE progressive, VALUE strip_metadata,
                                     VALUE execution, VALUE cancellable, VALUE has_scheduler,
-                                    VALUE strict);
+                                    VALUE strict, VALUE strip_icc, VALUE trim);
 
 static VALUE ip_status_to_exception(ip_status_t status) {
     switch (status) {
@@ -448,6 +491,11 @@ static ip_context_t *ip_context_new(void) {
     ctx->quality = 82;
     ctx->mozjpeg_trellis_enabled = 1;
     ctx->mozjpeg_scan_opt_enabled = 1;
+    ctx->scale_num = 1;
+    ctx->scale_denom = 1;
+    ctx->subsampling = IP_SUBSAMP_AUTO;
+    ctx->tune = IP_TUNE_HVS;
+    ctx->effort = IP_EFFORT_DEFAULT;
     ctx->selected_quality = 82;
     ctx->requested_execution = IP_EXEC_AUTO;
     ctx->resolved_execution = IP_EXEC_AUTO;
@@ -472,6 +520,7 @@ static void ip_context_free(ip_context_t *ctx) {
     free(ctx->output_path);
     free(ctx->transient_jpeg_buf);
     free(ctx->transient_decode_buf);
+    free(ctx->icc_profile);
 
     if (ctx->preserved_markers) {
         for (size_t i = 0; i < ctx->preserved_marker_count; i++) {
@@ -592,6 +641,96 @@ static struct jpeg_error_mgr *ip_use_error(ip_jpeg_error_mgr *jerr, ip_context_t
     return base;
 }
 
+static void ip_jpeg_longjmp_error(j_common_ptr cinfo, ip_status_t status) {
+    ip_jpeg_error_mgr *err = (ip_jpeg_error_mgr *)cinfo->err;
+    char buffer[JMSG_LENGTH_MAX];
+    (*cinfo->err->format_message)(cinfo, buffer);
+    ip_context_set_error(err->ctx, status, buffer);
+    if (err->ctx->jmp_armed)
+        longjmp(err->ctx->jmpbuf, 1);
+}
+
+static void ip_jpeg_invalid_error_exit(j_common_ptr cinfo) {
+    ip_jpeg_longjmp_error(cinfo, IP_ERR_INVALID_IMAGE);
+}
+
+static void ip_jpeg_encode_error_exit(j_common_ptr cinfo) {
+    ip_jpeg_longjmp_error(cinfo, IP_ERR_ENCODE);
+}
+
+static void ip_init_decompress(struct jpeg_decompress_struct *cinfo, ip_jpeg_error_mgr *jerr,
+                               ip_context_t *ctx) {
+    memset(cinfo, 0, sizeof(*cinfo));
+    memset(jerr, 0, sizeof(*jerr));
+    cinfo->err = ip_use_error(jerr, ctx, ip_jpeg_invalid_error_exit);
+}
+
+static void ip_init_compress(struct jpeg_compress_struct *cinfo, ip_jpeg_error_mgr *jerr,
+                             ip_context_t *ctx) {
+    memset(cinfo, 0, sizeof(*cinfo));
+    memset(jerr, 0, sizeof(*jerr));
+    cinfo->err = ip_use_error(jerr, ctx, ip_jpeg_encode_error_exit);
+}
+
+static void ip_open_mem_src(struct jpeg_decompress_struct *cinfo, const unsigned char *data,
+                            size_t size) {
+    jpeg_create_decompress(cinfo);
+    jpeg_mem_src(cinfo, data, (unsigned long)size);
+}
+
+static void ip_close_codec_pair(struct jpeg_compress_struct *dst,
+                                struct jpeg_decompress_struct *src, ip_context_t *ctx) {
+    jpeg_destroy_compress(dst);
+    jpeg_destroy_decompress(src);
+    ctx->jmp_armed = 0;
+}
+
+static void ip_claim_jpeg_output(ip_context_t *ctx, unsigned long jpeg_size) {
+    ctx->output_data = ctx->transient_jpeg_buf;
+    ctx->transient_jpeg_buf = NULL;
+    ctx->output_size = (size_t)jpeg_size;
+    ctx->output_owner = IP_OUTPUT_OWNER_MALLOC;
+}
+
+static int ip_within_output_limit(ip_context_t *ctx, unsigned long jpeg_size) {
+    if (ctx->max_output_size > 0 && (size_t)jpeg_size > ctx->max_output_size)
+        IP_FAIL(ctx, IP_ERR_LIMIT, "output exceeds max_output_size");
+    return 1;
+}
+
+static int ip_header_fits_int(ip_context_t *ctx, const struct jpeg_decompress_struct *cinfo) {
+    if (cinfo->image_width > (JDIMENSION)INT_MAX || cinfo->image_height > (JDIMENSION)INT_MAX)
+        IP_FAIL(ctx, IP_ERR_LIMIT, "JPEG dimensions exceed native int range");
+    return 1;
+}
+
+static int ip_reject_cmyk(ip_context_t *ctx, const struct jpeg_decompress_struct *cinfo) {
+    if (cinfo->num_components == 4 || cinfo->jpeg_color_space == JCS_CMYK ||
+        cinfo->jpeg_color_space == JCS_YCCK)
+        IP_FAIL(ctx, IP_ERR_UNSUPPORTED, "CMYK/YCCK JPEG input is not supported in this release");
+    return 1;
+}
+
+static void ip_apply_decode_scale(struct jpeg_decompress_struct *cinfo, const ip_context_t *ctx) {
+    if (ctx->scale_num > 0 && ctx->scale_denom > 0) {
+        cinfo->scale_num = ctx->scale_num;
+        cinfo->scale_denom = ctx->scale_denom;
+    }
+}
+
+static void ip_luma_samp(int mode, int *h, int *v) {
+    if (mode == IP_SUBSAMP_444) {
+        *h = 1;
+        *v = 1;
+    } else if (mode == IP_SUBSAMP_422) {
+        *h = 2;
+        *v = 1;
+    } else {
+        *h = 2;
+        *v = 2;
+    }
+}
+
 static void ip_apply_fast_decode(struct jpeg_decompress_struct *cinfo) {
     cinfo->dct_method = IP_FAST_DCT;
     cinfo->do_fancy_upsampling = FALSE;
@@ -607,7 +746,176 @@ static void ip_disable_mozjpeg_trellis(struct jpeg_compress_struct *cinfo) {
     jpeg_c_set_bool_param(cinfo, JBOOLEAN_TRELLIS_EOB_OPT, FALSE);
     jpeg_c_set_bool_param(cinfo, JBOOLEAN_USE_SCANS_IN_TRELLIS, FALSE);
     jpeg_c_set_bool_param(cinfo, JBOOLEAN_TRELLIS_Q_OPT, FALSE);
-    jpeg_c_set_bool_param(cinfo, JBOOLEAN_OVERSHOOT_DERINGING, FALSE);
+}
+
+static int ip_resolve_subsampling(const ip_context_t *ctx) {
+    if (ctx->subsampling != IP_SUBSAMP_AUTO)
+        return ctx->subsampling;
+    /* :fast / :jpeg_turbo keeps libjpeg 4:2:0 unless the caller opts in. */
+    if (ctx->algo == IP_ALGO_MOZJPEG && ctx->quality >= IP_AUTO_444_QUALITY)
+        return IP_SUBSAMP_444;
+    return IP_SUBSAMP_420;
+}
+
+static void ip_apply_subsampling(struct jpeg_compress_struct *cinfo, int mode) {
+    int h;
+    int v;
+    int ci;
+
+    if (cinfo->jpeg_color_space != JCS_YCbCr || cinfo->num_components < 3)
+        return;
+
+    ip_luma_samp(mode, &h, &v);
+    cinfo->comp_info[0].h_samp_factor = h;
+    cinfo->comp_info[0].v_samp_factor = v;
+    for (ci = 1; ci < cinfo->num_components; ci++) {
+        cinfo->comp_info[ci].h_samp_factor = 1;
+        cinfo->comp_info[ci].v_samp_factor = 1;
+    }
+}
+
+static void ip_set_tune_params(struct jpeg_compress_struct *cinfo, int tbl, float scale1,
+                               float scale2, boolean use_weights) {
+    jpeg_c_set_int_param(cinfo, JINT_BASE_QUANT_TBL_IDX, tbl);
+    jpeg_c_set_float_param(cinfo, JFLOAT_LAMBDA_LOG_SCALE1, scale1);
+    jpeg_c_set_float_param(cinfo, JFLOAT_LAMBDA_LOG_SCALE2, scale2);
+    jpeg_c_set_bool_param(cinfo, JBOOLEAN_USE_LAMBDA_WEIGHT_TBL, use_weights);
+}
+
+static void ip_apply_tune(struct jpeg_compress_struct *cinfo, int tune) {
+    switch (tune) {
+    case IP_TUNE_PSNR:
+        ip_set_tune_params(cinfo, 1, 9.0f, 0.0f, FALSE);
+        break;
+    case IP_TUNE_SSIM:
+        ip_set_tune_params(cinfo, 1, 11.5f, 12.75f, FALSE);
+        break;
+    case IP_TUNE_MS_SSIM:
+        ip_set_tune_params(cinfo, 3, 12.0f, 13.0f, TRUE);
+        break;
+    case IP_TUNE_HVS:
+    default:
+        ip_set_tune_params(cinfo, 3, 14.75f, 16.5f, TRUE);
+        break;
+    }
+}
+
+static void ip_apply_effort(struct jpeg_compress_struct *cinfo, int effort, int mozjpeg_size_mode) {
+    if (!mozjpeg_size_mode)
+        return;
+    if (effort == IP_EFFORT_MAX) {
+        jpeg_c_set_int_param(cinfo, JINT_TRELLIS_NUM_LOOPS, 3);
+        jpeg_c_set_bool_param(cinfo, JBOOLEAN_TRELLIS_Q_OPT, TRUE);
+    }
+}
+
+static void ip_configure_encoder(struct jpeg_compress_struct *cinfo, ip_context_t *ctx,
+                                 int mozjpeg_size_mode, int measurement) {
+    configure_mozjpeg_profile_before_defaults(cinfo, mozjpeg_size_mode);
+    jpeg_set_defaults(cinfo);
+    if (mozjpeg_size_mode)
+        ip_apply_tune(cinfo, ctx->tune);
+    jpeg_set_quality(cinfo, ctx->quality, TRUE);
+    configure_mozjpeg_features_after_defaults(cinfo, ctx, mozjpeg_size_mode, measurement);
+    ip_apply_effort(cinfo, ctx->effort, mozjpeg_size_mode);
+    ip_apply_subsampling(cinfo, ctx->subsampling_active);
+}
+
+static int ip_marker_is_saved(const ip_context_t *ctx, unsigned marker) {
+    if (marker == JPEG_APP0 + 1)
+        return 1;
+    if (marker == JPEG_APP0 + 2)
+        return !ctx->strip_icc;
+    if (ctx->strip_metadata)
+        return 0;
+    if (marker == JPEG_COM)
+        return 1;
+    if (marker >= JPEG_APP0 && marker <= JPEG_APP0 + 15)
+        return marker != JPEG_APP0;
+    return 0;
+}
+
+static int ip_marker_is_profile_chain(unsigned marker) {
+    return marker == JPEG_APP0 + 1 || marker == JPEG_APP0 + 2;
+}
+
+static int ip_scan_jpeg_marker_budget(ip_context_t *ctx) {
+    const unsigned char *p;
+    size_t n;
+    size_t i;
+    size_t misc_count = 0;
+    size_t profile_count = 0;
+    size_t bytes = 0;
+
+    if (!ctx->input_data || ctx->input_size < 2)
+        return 1;
+
+    p = ctx->input_data;
+    n = ctx->input_size;
+    if (p[0] != 0xFF || p[1] != 0xD8)
+        return 1;
+
+    i = 2;
+    while (i + 1 < n) {
+        unsigned marker;
+        unsigned len;
+
+        if (p[i] != 0xFF) {
+            i++;
+            continue;
+        }
+        while (i < n && p[i] == 0xFF)
+            i++;
+        if (i >= n)
+            break;
+        marker = p[i++];
+        if (marker == 0xD8)
+            continue;
+        if (marker == 0xD9 || marker == 0xDA)
+            break;
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7))
+            continue;
+        if (i + 2 > n)
+            break;
+        len = ((unsigned)p[i] << 8) | (unsigned)p[i + 1];
+        if (len < 2)
+            break;
+        if (ip_marker_is_saved(ctx, marker)) {
+            bytes += (size_t)(len - 2);
+            if (ip_marker_is_profile_chain(marker))
+                profile_count++;
+            else
+                misc_count++;
+            if (misc_count > IP_MAX_MARKERS || profile_count > IP_MAX_PROFILE_MARKERS ||
+                bytes > IP_MAX_MARKER_BYTES) {
+                ip_context_set_error(ctx, IP_ERR_LIMIT, "too many/too large JPEG metadata markers");
+                return 0;
+            }
+        }
+        i += len;
+    }
+    return 1;
+}
+
+static JXFORM_CODE ip_xform_for_orientation(int orientation) {
+    switch (orientation) {
+    case 2:
+        return JXFORM_FLIP_H;
+    case 3:
+        return JXFORM_ROT_180;
+    case 4:
+        return JXFORM_FLIP_V;
+    case 5:
+        return JXFORM_TRANSPOSE;
+    case 6:
+        return JXFORM_ROT_90;
+    case 7:
+        return JXFORM_TRANSVERSE;
+    case 8:
+        return JXFORM_ROT_270;
+    default:
+        return JXFORM_NONE;
+    }
 }
 
 static int ip_check_max_dimension_limits(ip_context_t *ctx) {
@@ -936,6 +1244,17 @@ static VALUE ip_build_report(ip_context_t *ctx, VALUE output_value) {
 
 static int ip_save_marker(ip_context_t *ctx, int marker, const unsigned char *data,
                           unsigned int len) {
+    size_t next_bytes = ctx->preserved_marker_bytes + (size_t)len;
+    int profile = ip_marker_is_profile_chain((unsigned)marker);
+    size_t next_profile = ctx->preserved_profile_marker_count + (profile ? 1 : 0);
+    size_t next_misc = ctx->preserved_misc_marker_count + (profile ? 0 : 1);
+
+    if (next_bytes > IP_MAX_MARKER_BYTES || next_profile > IP_MAX_PROFILE_MARKERS ||
+        next_misc > IP_MAX_MARKERS) {
+        ip_context_set_error(ctx, IP_ERR_LIMIT, "too many/too large JPEG metadata markers");
+        return 0;
+    }
+
     if (ctx->preserved_marker_count == ctx->preserved_marker_capacity) {
         if (ctx->preserved_marker_capacity > SIZE_MAX / 2)
             return 0;
@@ -960,6 +1279,11 @@ static int ip_save_marker(ip_context_t *ctx, int marker, const unsigned char *da
     ctx->preserved_markers[ctx->preserved_marker_count].data = copy;
     ctx->preserved_markers[ctx->preserved_marker_count].len = len;
     ctx->preserved_marker_count++;
+    ctx->preserved_marker_bytes += (size_t)len;
+    if (profile)
+        ctx->preserved_profile_marker_count++;
+    else
+        ctx->preserved_misc_marker_count++;
     return 1;
 }
 
@@ -971,7 +1295,8 @@ static int ip_save_markers_from_decompress(ip_context_t *ctx,
             continue;
 
         if (!ip_save_marker(ctx, m->marker, m->data, m->data_length)) {
-            ip_context_set_error(ctx, IP_ERR_OOM, "failed to preserve JPEG metadata marker");
+            if (ctx->status == IP_OK)
+                ip_context_set_error(ctx, IP_ERR_OOM, "failed to preserve JPEG metadata marker");
             return 0;
         }
     }
@@ -1138,22 +1463,57 @@ static void ip_write_preserved_markers(ip_context_t *ctx, struct jpeg_compress_s
     }
 }
 
-static void ip_jpeg_invalid_error_exit(j_common_ptr cinfo) {
-    ip_jpeg_error_mgr *err = (ip_jpeg_error_mgr *)cinfo->err;
-    char buffer[JMSG_LENGTH_MAX];
-    (*cinfo->err->format_message)(cinfo, buffer);
-    ip_context_set_error(err->ctx, IP_ERR_INVALID_IMAGE, buffer);
-    if (err->ctx->jmp_armed)
-        longjmp(err->ctx->jmpbuf, 1);
+static int ip_capture_icc(ip_context_t *ctx, struct jpeg_decompress_struct *cinfo) {
+    JOCTET *icc = NULL;
+    unsigned int len = 0;
+
+    if (ctx->strip_icc)
+        return 1;
+    if (!jpeg_read_icc_profile(cinfo, &icc, &len) || !icc || len == 0)
+        return 1;
+    if (len > IP_MAX_ICC_BYTES) {
+        free(icc);
+        return 1;
+    }
+    free(ctx->icc_profile);
+    ctx->icc_profile = icc;
+    ctx->icc_len = len;
+    return 1;
 }
 
-static void ip_jpeg_encode_error_exit(j_common_ptr cinfo) {
-    ip_jpeg_error_mgr *err = (ip_jpeg_error_mgr *)cinfo->err;
-    char buffer[JMSG_LENGTH_MAX];
-    (*cinfo->err->format_message)(cinfo, buffer);
-    ip_context_set_error(err->ctx, IP_ERR_ENCODE, buffer);
-    if (err->ctx->jmp_armed)
-        longjmp(err->ctx->jmpbuf, 1);
+static void ip_write_sidecar_metadata(ip_context_t *ctx, struct jpeg_compress_struct *cinfo) {
+    if (!ctx->strip_metadata) {
+        ip_write_preserved_markers(ctx, cinfo);
+        return;
+    }
+    if (ctx->icc_profile && ctx->icc_len > 0)
+        jpeg_write_icc_profile(cinfo, ctx->icc_profile, ctx->icc_len);
+}
+
+static int ip_prepare_source_markers(ip_context_t *ctx, struct jpeg_decompress_struct *cinfo) {
+    if (!ip_scan_jpeg_marker_budget(ctx))
+        return 0;
+    ip_setup_marker_saving(cinfo, ctx);
+    return 1;
+}
+
+static int ip_read_source_header(ip_context_t *ctx, struct jpeg_decompress_struct *cinfo) {
+    if (jpeg_read_header(cinfo, TRUE) != JPEG_HEADER_OK)
+        IP_FAIL(ctx, IP_ERR_INVALID_IMAGE, "invalid JPEG header");
+    ctx->source_orientation = ip_read_exif_orientation_from_decompress(cinfo);
+    return 1;
+}
+
+static int ip_open_source_jpeg(ip_context_t *ctx, struct jpeg_decompress_struct *cinfo) {
+    return ip_prepare_source_markers(ctx, cinfo) && ip_read_source_header(ctx, cinfo);
+}
+
+static int ip_ingest_source_metadata(ip_context_t *ctx, struct jpeg_decompress_struct *cinfo) {
+    if (!ip_capture_icc(ctx, cinfo))
+        return 0;
+    if (!ctx->strip_metadata && !ip_save_markers_from_decompress(ctx, cinfo))
+        return 0;
+    return 1;
 }
 
 static const char *ip_jpeg_color_space_name(int color_space) {
@@ -1180,16 +1540,13 @@ static int ip_inspect_jpeg_header(ip_context_t *ctx, int allow_cmyk_ycck) {
 
     struct jpeg_decompress_struct cinfo;
     ip_jpeg_error_mgr jerr;
-    memset(&cinfo, 0, sizeof(cinfo));
-    memset(&jerr, 0, sizeof(jerr));
-    cinfo.err = ip_use_error(&jerr, ctx, ip_jpeg_invalid_error_exit);
+    ip_init_decompress(&cinfo, &jerr, ctx);
 
     ctx->jmp_armed = 1;
     if (setjmp(ctx->jmpbuf))
         goto fail;
 
-    jpeg_create_decompress(&cinfo);
-    jpeg_mem_src(&cinfo, ctx->input_data, (unsigned long)ctx->input_size);
+    ip_open_mem_src(&cinfo, ctx->input_data, ctx->input_size);
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK)
         IP_FAIL_GOTO(ctx, IP_ERR_INVALID_IMAGE, "invalid JPEG header");
 
@@ -1275,20 +1632,18 @@ static void configure_mozjpeg_profile_before_defaults(struct jpeg_compress_struc
 }
 
 static void configure_mozjpeg_features_after_defaults(struct jpeg_compress_struct *cinfo,
-                                                      int mozjpeg_size_mode,
-                                                      int progressive_requested,
-                                                      int mozjpeg_trellis_enabled,
-                                                      int scan_opt_enabled, int measurement) {
+                                                      const ip_context_t *ctx,
+                                                      int mozjpeg_size_mode, int measurement) {
     if (mozjpeg_size_mode) {
         cinfo->optimize_coding = TRUE;
 
-        if (progressive_requested) {
-            if (mozjpeg_trellis_enabled) {
+        if (ctx->progressive) {
+            if (ctx->mozjpeg_trellis_enabled) {
                 jpeg_c_set_bool_param(cinfo, JBOOLEAN_USE_SCANS_IN_TRELLIS, TRUE);
                 jpeg_c_set_bool_param(cinfo, JBOOLEAN_TRELLIS_EOB_OPT, TRUE);
             }
             jpeg_c_set_int_param(cinfo, JINT_DC_SCAN_OPT_MODE, 2);
-            int run_scan_search = (measurement || !scan_opt_enabled) ? FALSE : TRUE;
+            int run_scan_search = (measurement || !ctx->mozjpeg_scan_opt_enabled) ? FALSE : TRUE;
             jpeg_c_set_bool_param(cinfo, JBOOLEAN_OPTIMIZE_SCANS, run_scan_search);
             jpeg_simple_progression(cinfo);
             jpeg_c_set_bool_param(cinfo, JBOOLEAN_OPTIMIZE_SCANS, run_scan_search);
@@ -1298,7 +1653,7 @@ static void configure_mozjpeg_features_after_defaults(struct jpeg_compress_struc
             jpeg_c_set_bool_param(cinfo, JBOOLEAN_OPTIMIZE_SCANS, FALSE);
         }
 
-        if (!mozjpeg_trellis_enabled)
+        if (!ctx->mozjpeg_trellis_enabled)
             ip_disable_mozjpeg_trellis(cinfo);
 
         return;
@@ -1310,7 +1665,7 @@ static void configure_mozjpeg_features_after_defaults(struct jpeg_compress_struc
     jpeg_c_set_bool_param(cinfo, JBOOLEAN_OPTIMIZE_SCANS, FALSE);
     ip_disable_mozjpeg_trellis(cinfo);
 
-    if (progressive_requested) {
+    if (ctx->progressive) {
         jpeg_simple_progression(cinfo);
         cinfo->optimize_coding = TRUE;
     }
@@ -1320,9 +1675,7 @@ static int encode_pixels_with_libjpeg(ip_context_t *ctx, int mozjpeg_size_mode, 
     struct jpeg_compress_struct cinfo;
     ip_jpeg_error_mgr jerr;
     unsigned long jpeg_size = 0;
-    memset(&cinfo, 0, sizeof(cinfo));
-    memset(&jerr, 0, sizeof(jerr));
-    cinfo.err = ip_use_error(&jerr, ctx, ip_jpeg_encode_error_exit);
+    ip_init_compress(&cinfo, &jerr, ctx);
     ctx->transient_jpeg_buf = NULL;
 
     ctx->jmp_armed = 1;
@@ -1345,17 +1698,10 @@ static int encode_pixels_with_libjpeg(ip_context_t *ctx, int mozjpeg_size_mode, 
             ctx->channels == 4 ? JCS_EXT_RGBA : color_space_for_channels(ctx->channels);
     }
 
-    configure_mozjpeg_profile_before_defaults(&cinfo, mozjpeg_size_mode);
-    jpeg_set_defaults(&cinfo);
-    jpeg_set_quality(&cinfo, ctx->quality, TRUE);
-    configure_mozjpeg_features_after_defaults(&cinfo, mozjpeg_size_mode, ctx->progressive,
-                                              ctx->mozjpeg_trellis_enabled,
-                                              ctx->mozjpeg_scan_opt_enabled, measurement);
+    ip_configure_encoder(&cinfo, ctx, mozjpeg_size_mode, measurement);
 
     jpeg_start_compress(&cinfo, TRUE);
-
-    if (!ctx->strip_metadata)
-        ip_write_preserved_markers(ctx, &cinfo);
+    ip_write_sidecar_metadata(ctx, &cinfo);
 
     while (cinfo.next_scanline < cinfo.image_height) {
         if (atomic_load(&ctx->cancelled))
@@ -1376,16 +1722,12 @@ static int encode_pixels_with_libjpeg(ip_context_t *ctx, int mozjpeg_size_mode, 
 
     jpeg_finish_compress(&cinfo);
 
-    if (!measurement && ctx->max_output_size > 0 && (size_t)jpeg_size > ctx->max_output_size)
-        IP_FAIL_GOTO(ctx, IP_ERR_LIMIT, "output exceeds max_output_size");
+    if (!measurement && !ip_within_output_limit(ctx, jpeg_size))
+        goto fail;
 
     jpeg_destroy_compress(&cinfo);
     ctx->jmp_armed = 0;
-
-    ctx->output_data = ctx->transient_jpeg_buf;
-    ctx->transient_jpeg_buf = NULL;
-    ctx->output_size = (size_t)jpeg_size;
-    ctx->output_owner = IP_OUTPUT_OWNER_MALLOC;
+    ip_claim_jpeg_output(ctx, jpeg_size);
     return 1;
 
 fail:
@@ -1401,9 +1743,7 @@ static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, i
                                     int allow_ycbcr_transcode) {
     struct jpeg_decompress_struct cinfo;
     ip_jpeg_error_mgr jerr;
-    memset(&cinfo, 0, sizeof(cinfo));
-    memset(&jerr, 0, sizeof(jerr));
-    cinfo.err = ip_use_error(&jerr, ctx, ip_jpeg_invalid_error_exit);
+    ip_init_decompress(&cinfo, &jerr, ctx);
     ctx->transient_decode_buf = NULL;
     ctx->source_orientation = 1;
     ctx->decoded_as_ycbcr = 0;
@@ -1415,28 +1755,11 @@ static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, i
         goto fail;
     }
 
-    jpeg_create_decompress(&cinfo);
-    jpeg_mem_src(&cinfo, ctx->input_data, (unsigned long)ctx->input_size);
-
-    jpeg_save_markers(&cinfo, JPEG_APP0 + 1, 0xFFFF);
-    if (!ctx->strip_metadata) {
-        jpeg_save_markers(&cinfo, JPEG_COM, 0xFFFF);
-        for (int app = 2; app < 16; app++)
-            jpeg_save_markers(&cinfo, JPEG_APP0 + app, 0xFFFF);
-    }
-
-    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK)
-        IP_FAIL_GOTO(ctx, IP_ERR_INVALID_IMAGE, "invalid JPEG header");
-
-    ctx->source_orientation = ip_read_exif_orientation_from_decompress(&cinfo);
-
-    if (cinfo.image_width > (JDIMENSION)INT_MAX || cinfo.image_height > (JDIMENSION)INT_MAX)
-        IP_FAIL_GOTO(ctx, IP_ERR_LIMIT, "JPEG dimensions exceed native int range");
-
-    if (cinfo.num_components == 4 || cinfo.jpeg_color_space == JCS_CMYK ||
-        cinfo.jpeg_color_space == JCS_YCCK)
-        IP_FAIL_GOTO(ctx, IP_ERR_UNSUPPORTED,
-                     "CMYK/YCCK JPEG input is not supported in this release");
+    ip_open_mem_src(&cinfo, ctx->input_data, ctx->input_size);
+    if (!ip_open_source_jpeg(ctx, &cinfo))
+        goto fail;
+    if (!ip_header_fits_int(ctx, &cinfo) || !ip_reject_cmyk(ctx, &cinfo))
+        goto fail;
 
     int ch = cinfo.num_components == 1 ? 1 : 3;
 
@@ -1453,12 +1776,21 @@ static int ip_jpeg_decode_to_pixels(ip_context_t *ctx, unsigned char **pixels, i
     int use_ycbcr = allow_ycbcr_transcode && ch == 3;
     cinfo.out_color_space = ch == 1 ? JCS_GRAYSCALE : (use_ycbcr ? JCS_YCbCr : JCS_RGB);
     ctx->decoded_as_ycbcr = use_ycbcr;
+    ip_apply_decode_scale(&cinfo, ctx);
     if (fast_decode_mode)
         ip_apply_fast_decode(&cinfo);
 
     jpeg_start_decompress(&cinfo);
 
-    if (!ctx->strip_metadata && !ip_save_markers_from_decompress(ctx, &cinfo))
+    ctx->width = (int)cinfo.output_width;
+    ctx->height = (int)cinfo.output_height;
+    if (!ip_checked_image_size(ctx->width, ctx->height, ctx->channels, &ctx->decoded_bytes))
+        IP_FAIL_GOTO(ctx, IP_ERR_LIMIT, "decoded image size overflows native size");
+    validate_limits_for_pixels(ctx);
+    if (ctx->status != IP_OK)
+        goto fail;
+
+    if (!ip_ingest_source_metadata(ctx, &cinfo))
         goto fail;
 
     size_t row_stride = 0;
@@ -1528,9 +1860,164 @@ fail:
     return 0;
 }
 
+static void ip_free_raw_planes(JSAMPARRAY planes[3], unsigned char *bufs[3]) {
+    int ci;
+    for (ci = 0; ci < 3; ci++) {
+        free(planes[ci]);
+        planes[ci] = NULL;
+        free(bufs[ci]);
+        bufs[ci] = NULL;
+    }
+}
+
+static int ip_alloc_raw_planes(ip_context_t *ctx, struct jpeg_decompress_struct *src,
+                               JSAMPARRAY planes[3], unsigned char *bufs[3], int *rows_out) {
+    int ci;
+    int rows = (int)src->max_v_samp_factor * DCTSIZE;
+
+    memset(planes, 0, sizeof(JSAMPARRAY) * 3);
+    memset(bufs, 0, sizeof(unsigned char *) * 3);
+    *rows_out = rows;
+
+    for (ci = 0; ci < src->num_components && ci < 3; ci++) {
+        int width = (int)src->comp_info[ci].width_in_blocks * DCTSIZE;
+        size_t plane_size = (size_t)rows * (size_t)width;
+        int r;
+
+        planes[ci] = (JSAMPARRAY)malloc((size_t)rows * sizeof(JSAMPROW));
+        bufs[ci] = (unsigned char *)malloc(plane_size);
+        if ((!planes[ci] || !bufs[ci]) && (rows > 0) && (width > 0)) {
+            ip_context_set_error(ctx, IP_ERR_OOM, "failed to allocate raw JPEG plane buffer");
+            ip_free_raw_planes(planes, bufs);
+            return 0;
+        }
+        for (r = 0; r < rows; r++)
+            planes[ci][r] = bufs[ci] + ((size_t)r * (size_t)width);
+    }
+    return 1;
+}
+
+/* Returns 1 on success, 0 on fallback (status still IP_OK) or error. */
+static int encode_jpeg_raw_transcode(ip_context_t *ctx, int mozjpeg_size_mode) {
+    struct jpeg_decompress_struct srcinfo;
+    struct jpeg_compress_struct dstinfo;
+    ip_jpeg_error_mgr srcerr;
+    ip_jpeg_error_mgr dsterr;
+    JSAMPARRAY planes[3];
+    unsigned char *bufs[3];
+    int rows = 0;
+    unsigned long jpeg_size = 0;
+    int want_h = 2;
+    int want_v = 2;
+
+    ip_init_decompress(&srcinfo, &srcerr, ctx);
+    ip_init_compress(&dstinfo, &dsterr, ctx);
+    memset(planes, 0, sizeof(planes));
+    memset(bufs, 0, sizeof(bufs));
+    ctx->transient_jpeg_buf = NULL;
+
+    ctx->jmp_armed = 1;
+    if (setjmp(ctx->jmpbuf)) {
+        if (ctx->status == IP_OK)
+            ip_context_set_error(ctx, IP_ERR_ENCODE, "raw JPEG transcode failed");
+        goto fail;
+    }
+
+    ip_open_mem_src(&srcinfo, ctx->input_data, ctx->input_size);
+    if (!ip_open_source_jpeg(ctx, &srcinfo))
+        goto fail;
+    if (ctx->strip_metadata && ctx->source_orientation > 1)
+        goto fail;
+
+    if (srcinfo.jpeg_color_space != JCS_YCbCr || srcinfo.num_components != 3)
+        goto fail;
+    if (ctx->scale_denom > 0 && !(ctx->scale_num == 1 && ctx->scale_denom == 1))
+        goto fail;
+
+    ctx->subsampling_active = ip_resolve_subsampling(ctx);
+    ip_luma_samp(ctx->subsampling_active, &want_h, &want_v);
+    if (srcinfo.comp_info[0].h_samp_factor != want_h ||
+        srcinfo.comp_info[0].v_samp_factor != want_v || srcinfo.comp_info[1].h_samp_factor != 1 ||
+        srcinfo.comp_info[1].v_samp_factor != 1 || srcinfo.comp_info[2].h_samp_factor != 1 ||
+        srcinfo.comp_info[2].v_samp_factor != 1)
+        goto fail;
+
+    ip_apply_decode_scale(&srcinfo, ctx);
+    srcinfo.raw_data_out = TRUE;
+    srcinfo.out_color_space = JCS_YCbCr;
+    jpeg_start_decompress(&srcinfo);
+
+    ctx->width = (int)srcinfo.output_width;
+    ctx->height = (int)srcinfo.output_height;
+    ctx->channels = 3;
+    if (!ip_checked_image_size(ctx->width, ctx->height, ctx->channels, &ctx->decoded_bytes))
+        IP_FAIL_GOTO(ctx, IP_ERR_LIMIT, "decoded image size overflows native size");
+    validate_limits_for_pixels(ctx);
+    if (ctx->status != IP_OK)
+        goto fail;
+
+    if (!ip_ingest_source_metadata(ctx, &srcinfo))
+        goto fail;
+
+    if (!ip_alloc_raw_planes(ctx, &srcinfo, planes, bufs, &rows))
+        goto fail;
+
+    jpeg_create_compress(&dstinfo);
+    jpeg_mem_dest(&dstinfo, &ctx->transient_jpeg_buf, &jpeg_size);
+    dstinfo.image_width = srcinfo.output_width;
+    dstinfo.image_height = srcinfo.output_height;
+    dstinfo.input_components = 3;
+    dstinfo.in_color_space = JCS_YCbCr;
+    ip_configure_encoder(&dstinfo, ctx, mozjpeg_size_mode, 0);
+    dstinfo.raw_data_in = TRUE;
+
+    jpeg_start_compress(&dstinfo, TRUE);
+    ip_write_sidecar_metadata(ctx, &dstinfo);
+
+    while (srcinfo.output_scanline < srcinfo.output_height) {
+        JDIMENSION got;
+
+        if (atomic_load(&ctx->cancelled))
+            IP_FAIL_GOTO(ctx, IP_ERR_CANCELLED, "JPEG transcode cancelled");
+
+        got = jpeg_read_raw_data(&srcinfo, planes, (JDIMENSION)rows);
+        if (got == 0)
+            IP_FAIL_GOTO(ctx, IP_ERR_INVALID_IMAGE, "failed to read raw JPEG data");
+        if (jpeg_write_raw_data(&dstinfo, planes, (JDIMENSION)rows) == 0)
+            IP_FAIL_GOTO(ctx, IP_ERR_ENCODE, "failed to write raw JPEG data");
+    }
+
+    jpeg_finish_compress(&dstinfo);
+    jpeg_finish_decompress(&srcinfo);
+
+    if (!ip_within_output_limit(ctx, jpeg_size))
+        goto fail;
+
+    ip_free_raw_planes(planes, bufs);
+    ip_close_codec_pair(&dstinfo, &srcinfo, ctx);
+    ip_claim_jpeg_output(ctx, jpeg_size);
+    return 1;
+
+fail:
+    ip_close_codec_pair(&dstinfo, &srcinfo, ctx);
+    ip_free_raw_planes(planes, bufs);
+    free(ctx->transient_jpeg_buf);
+    ctx->transient_jpeg_buf = NULL;
+    return 0;
+}
+
 static int compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_size_mode) {
     if (ctx->pixel_data) {
+        ctx->subsampling_active = ip_resolve_subsampling(ctx);
         return encode_pixels_with_libjpeg(ctx, mozjpeg_size_mode, 0);
+    }
+
+    if (!ctx->ssim_guard_enabled &&
+        (ctx->scale_denom == 0 || (ctx->scale_num == 1 && ctx->scale_denom == 1))) {
+        if (encode_jpeg_raw_transcode(ctx, mozjpeg_size_mode))
+            return 1;
+        if (ctx->status != IP_OK)
+            return 0;
     }
 
     unsigned char *pixels = NULL;
@@ -1547,6 +2034,7 @@ static int compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_size_mod
     ctx->height = height;
     ctx->channels = channels;
     ctx->decoded_bytes = ctx->pixel_size;
+    ctx->subsampling_active = ip_resolve_subsampling(ctx);
 
     return encode_pixels_with_libjpeg(ctx, mozjpeg_size_mode, 0);
 }
@@ -1567,9 +2055,7 @@ static int ip_decode_jpeg_to_luma_buffer(ip_context_t *ctx, const unsigned char 
                                          unsigned char **luma, int *width, int *height) {
     struct jpeg_decompress_struct cinfo;
     ip_jpeg_error_mgr jerr;
-    memset(&cinfo, 0, sizeof(cinfo));
-    memset(&jerr, 0, sizeof(jerr));
-    cinfo.err = ip_use_error(&jerr, ctx, ip_jpeg_invalid_error_exit);
+    ip_init_decompress(&cinfo, &jerr, ctx);
     ctx->transient_decode_buf = NULL;
 
     ctx->jmp_armed = 1;
@@ -1579,19 +2065,12 @@ static int ip_decode_jpeg_to_luma_buffer(ip_context_t *ctx, const unsigned char 
         goto fail;
     }
 
-    jpeg_create_decompress(&cinfo);
-    jpeg_mem_src(&cinfo, data, (unsigned long)size);
+    ip_open_mem_src(&cinfo, data, size);
 
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK)
         IP_FAIL_GOTO(ctx, IP_ERR_INVALID_IMAGE, "invalid JPEG header");
-
-    if (cinfo.image_width > (JDIMENSION)INT_MAX || cinfo.image_height > (JDIMENSION)INT_MAX)
-        IP_FAIL_GOTO(ctx, IP_ERR_LIMIT, "JPEG dimensions exceed native int range");
-
-    if (cinfo.num_components == 4 || cinfo.jpeg_color_space == JCS_CMYK ||
-        cinfo.jpeg_color_space == JCS_YCCK)
-        IP_FAIL_GOTO(ctx, IP_ERR_UNSUPPORTED,
-                     "CMYK/YCCK JPEG input is not supported in this release");
+    if (!ip_header_fits_int(ctx, &cinfo) || !ip_reject_cmyk(ctx, &cinfo))
+        goto fail;
 
     int old_width = ctx->width;
     int old_height = ctx->height;
@@ -1918,6 +2397,9 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
     if (!reference_luma)
         return 0;
 
+    ctx->subsampling_active = ip_resolve_subsampling(ctx);
+
+    int search_start_quality = ctx->quality;
     int search_low = ctx->quality;
     int search_high = 100;
     int best_quality = -1;
@@ -1931,6 +2413,7 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
     int q_lo = 0, q_hi = 0;
     double s_lo = 0.0, s_hi = 0.0;
 
+ssim_search:
     while (search_low <= search_high) {
         if (atomic_load(&ctx->cancelled)) {
             free(reference_luma);
@@ -1990,6 +2473,20 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
     }
 
     if (best_quality < 0) {
+        if (ctx->subsampling == IP_SUBSAMP_AUTO && ctx->subsampling_active == IP_SUBSAMP_420) {
+            ctx->subsampling_active = IP_SUBSAMP_444;
+            ctx->quality = search_start_quality;
+            search_low = search_start_quality;
+            search_high = 100;
+            best_quality = -1;
+            best_ssim = 0.0;
+            free(best_jpeg);
+            best_jpeg = NULL;
+            best_jpeg_size = 0;
+            have_lo = 0;
+            have_hi = 0;
+            goto ssim_search;
+        }
         char message[512];
         snprintf(message, sizeof(message),
                  "cannot satisfy min_ssim=%.6f; best observed SSIM %.6f at quality=%d",
@@ -2072,11 +2569,15 @@ static int guarded_compress_jpeg_input_with_mode(ip_context_t *ctx, int mozjpeg_
     return 1;
 }
 
-static void ip_setup_marker_saving(struct jpeg_decompress_struct *cinfo, int strip_metadata) {
+static void ip_setup_marker_saving(struct jpeg_decompress_struct *cinfo, const ip_context_t *ctx) {
     jpeg_save_markers(cinfo, JPEG_APP0 + 1, 0xFFFF);
-    if (!strip_metadata) {
+    if (!ctx->strip_icc)
+        jpeg_save_markers(cinfo, JPEG_APP0 + 2, 0xFFFF);
+    if (!ctx->strip_metadata) {
         jpeg_save_markers(cinfo, JPEG_COM, 0xFFFF);
-        for (int app = 2; app < 16; app++) {
+        for (int app = 0; app < 16; app++) {
+            if (app == 1 || app == 2)
+                continue;
             jpeg_save_markers(cinfo, JPEG_APP0 + app, 0xFFFF);
         }
     }
@@ -2084,10 +2585,8 @@ static void ip_setup_marker_saving(struct jpeg_decompress_struct *cinfo, int str
 
 static int ip_validate_lossless_optimize_header(ip_context_t *ctx,
                                                 struct jpeg_decompress_struct *srcinfo) {
-    if (srcinfo->image_width > (JDIMENSION)INT_MAX || srcinfo->image_height > (JDIMENSION)INT_MAX) {
-        ip_context_set_error(ctx, IP_ERR_LIMIT, "JPEG dimensions exceed native int range");
+    if (!ip_header_fits_int(ctx, srcinfo))
         return 0;
-    }
 
     ctx->width = (int)srcinfo->image_width;
     ctx->height = (int)srcinfo->image_height;
@@ -2109,14 +2608,9 @@ static int ip_lossless_optimize_jpeg(ip_context_t *ctx) {
     jvirt_barray_ptr *coef_arrays = NULL;
     unsigned long jpeg_size = 0;
 
-    memset(&srcinfo, 0, sizeof(srcinfo));
-    memset(&dstinfo, 0, sizeof(dstinfo));
-    memset(&srcerr, 0, sizeof(srcerr));
-    memset(&dsterr, 0, sizeof(dsterr));
+    ip_init_decompress(&srcinfo, &srcerr, ctx);
+    ip_init_compress(&dstinfo, &dsterr, ctx);
     ctx->transient_jpeg_buf = NULL;
-
-    srcinfo.err = ip_use_error(&srcerr, ctx, ip_jpeg_invalid_error_exit);
-    dstinfo.err = ip_use_error(&dsterr, ctx, ip_jpeg_encode_error_exit);
 
     ctx->jmp_armed = 1;
     if (setjmp(ctx->jmpbuf)) {
@@ -2125,28 +2619,39 @@ static int ip_lossless_optimize_jpeg(ip_context_t *ctx) {
         goto fail;
     }
 
+    jpeg_transform_info xform;
+    jvirt_barray_ptr *dst_coef_arrays = NULL;
+
+    memset(&xform, 0, sizeof(xform));
+    xform.trim = ctx->trim_partial_mcus ? TRUE : FALSE;
+    xform.perfect = ctx->trim_partial_mcus ? FALSE : TRUE;
+
     jpeg_create_decompress(&srcinfo);
     jpeg_create_compress(&dstinfo);
     jpeg_mem_src(&srcinfo, ctx->input_data, (unsigned long)ctx->input_size);
-    ip_setup_marker_saving(&srcinfo, ctx->strip_metadata);
+    if (!ip_prepare_source_markers(ctx, &srcinfo))
+        goto fail;
 
     if (atomic_load(&ctx->cancelled))
         IP_FAIL_GOTO(ctx, IP_ERR_CANCELLED, "lossless JPEG optimize cancelled");
 
-    if (jpeg_read_header(&srcinfo, TRUE) != JPEG_HEADER_OK)
-        IP_FAIL_GOTO(ctx, IP_ERR_INVALID_IMAGE, "invalid JPEG header");
-
-    ctx->source_orientation = ip_read_exif_orientation_from_decompress(&srcinfo);
+    if (!ip_read_source_header(ctx, &srcinfo))
+        goto fail;
     if (ctx->strip_metadata && ctx->source_orientation > 1)
-        IP_FAIL_GOTO(ctx, IP_ERR_UNSUPPORTED,
-                     "lossless optimize cannot strip EXIF Orientation without changing "
-                     "visual orientation; use strip_metadata: false or ImagePack.compress");
+        xform.transform = ip_xform_for_orientation(ctx->source_orientation);
 
     if (!ip_validate_lossless_optimize_header(ctx, &srcinfo))
         goto fail;
 
-    if (!ctx->strip_metadata && !ip_save_markers_from_decompress(ctx, &srcinfo))
+    if (!ip_ingest_source_metadata(ctx, &srcinfo))
         goto fail;
+
+    if (xform.transform != JXFORM_NONE) {
+        if (!jtransform_request_workspace(&srcinfo, &xform))
+            IP_FAIL_GOTO(ctx, IP_ERR_UNSUPPORTED,
+                         "lossless EXIF Orientation transform would crop partial MCU edges; "
+                         "pass trim: true to allow cropping, or ImagePack.compress");
+    }
 
     coef_arrays = jpeg_read_coefficients(&srcinfo);
     jpeg_copy_critical_parameters(&srcinfo, &dstinfo);
@@ -2154,41 +2659,42 @@ static int ip_lossless_optimize_jpeg(ip_context_t *ctx) {
     dstinfo.num_scans = 0;
     dstinfo.scan_info = NULL;
     if (ctx->progressive) {
+        jpeg_c_set_bool_param(&dstinfo, JBOOLEAN_OPTIMIZE_SCANS, TRUE);
         jpeg_simple_progression(&dstinfo);
         dstinfo.optimize_coding = TRUE;
+    } else {
+        jpeg_c_set_bool_param(&dstinfo, JBOOLEAN_OPTIMIZE_SCANS, FALSE);
     }
+
+    if (xform.transform != JXFORM_NONE)
+        dst_coef_arrays = jtransform_adjust_parameters(&srcinfo, &dstinfo, coef_arrays, &xform);
+    else
+        dst_coef_arrays = coef_arrays;
 
     jpeg_mem_dest(&dstinfo, &ctx->transient_jpeg_buf, &jpeg_size);
 
     if (atomic_load(&ctx->cancelled))
         IP_FAIL_GOTO(ctx, IP_ERR_CANCELLED, "lossless JPEG optimize cancelled");
 
-    jpeg_write_coefficients(&dstinfo, coef_arrays);
-    if (!ctx->strip_metadata)
-        ip_write_preserved_markers(ctx, &dstinfo);
+    jpeg_write_coefficients(&dstinfo, dst_coef_arrays);
+    ip_write_sidecar_metadata(ctx, &dstinfo);
+    if (xform.transform != JXFORM_NONE)
+        jtransform_execute_transform(&srcinfo, &dstinfo, coef_arrays, &xform);
 
     jpeg_finish_compress(&dstinfo);
     jpeg_finish_decompress(&srcinfo);
 
-    if (ctx->max_output_size > 0 && (size_t)jpeg_size > ctx->max_output_size)
-        IP_FAIL_GOTO(ctx, IP_ERR_LIMIT, "output exceeds max_output_size");
+    if (!ip_within_output_limit(ctx, jpeg_size))
+        goto fail;
 
-    jpeg_destroy_compress(&dstinfo);
-    jpeg_destroy_decompress(&srcinfo);
-    ctx->jmp_armed = 0;
-
-    ctx->output_data = ctx->transient_jpeg_buf;
-    ctx->transient_jpeg_buf = NULL;
-    ctx->output_size = (size_t)jpeg_size;
-    ctx->output_owner = IP_OUTPUT_OWNER_MALLOC;
+    ip_close_codec_pair(&dstinfo, &srcinfo, ctx);
+    ip_claim_jpeg_output(ctx, jpeg_size);
     return 1;
 
 fail:
-    jpeg_destroy_compress(&dstinfo);
-    jpeg_destroy_decompress(&srcinfo);
+    ip_close_codec_pair(&dstinfo, &srcinfo, ctx);
     free(ctx->transient_jpeg_buf);
     ctx->transient_jpeg_buf = NULL;
-    ctx->jmp_armed = 0;
     return 0;
 }
 
@@ -2264,16 +2770,16 @@ static void *ip_run_encode_nogvl(void *data) {
     return NULL;
 }
 
-static int ip_run_context(ip_context_t *ctx) {
+static int ip_invoke(ip_context_t *ctx, void *(*fn)(void *)) {
     ip_resolve_execution(ctx);
 
     if (ctx->resolved_execution == IP_EXEC_DIRECT) {
-        ip_run_encode_nogvl(ctx);
+        fn(ctx);
     } else if (ctx->resolved_execution == IP_EXEC_NOGVL) {
-        rb_nogvl(ip_run_encode_nogvl, ctx, ip_unblock_function, ctx, 0);
+        rb_nogvl(fn, ctx, ip_unblock_function, ctx, 0);
     } else if (ctx->resolved_execution == IP_EXEC_OFFLOAD) {
 #if IMAGE_PACK_HAS_OFFLOAD_SAFE
-        rb_nogvl(ip_run_encode_nogvl, ctx, ip_unblock_function, ctx, RB_NOGVL_OFFLOAD_SAFE);
+        rb_nogvl(fn, ctx, ip_unblock_function, ctx, RB_NOGVL_OFFLOAD_SAFE);
 #else
         ip_context_set_error(ctx, IP_ERR_UNSUPPORTED,
                              "offload execution is unavailable in this runtime; it requires Ruby "
@@ -2287,6 +2793,10 @@ static int ip_run_context(ip_context_t *ctx) {
         rb_thread_check_ints();
 
     return ctx->status == IP_OK;
+}
+
+static int ip_run_context(ip_context_t *ctx) {
+    return ip_invoke(ctx, ip_run_encode_nogvl);
 }
 
 static void *ip_run_optimize_nogvl(void *data) {
@@ -2297,28 +2807,7 @@ static void *ip_run_optimize_nogvl(void *data) {
 }
 
 static int ip_run_optimize_context(ip_context_t *ctx) {
-    ip_resolve_execution(ctx);
-
-    if (ctx->resolved_execution == IP_EXEC_DIRECT) {
-        ip_run_optimize_nogvl(ctx);
-    } else if (ctx->resolved_execution == IP_EXEC_NOGVL) {
-        rb_nogvl(ip_run_optimize_nogvl, ctx, ip_unblock_function, ctx, 0);
-    } else if (ctx->resolved_execution == IP_EXEC_OFFLOAD) {
-#if IMAGE_PACK_HAS_OFFLOAD_SAFE
-        rb_nogvl(ip_run_optimize_nogvl, ctx, ip_unblock_function, ctx, RB_NOGVL_OFFLOAD_SAFE);
-#else
-        ip_context_set_error(ctx, IP_ERR_UNSUPPORTED,
-                             "offload execution is unavailable in this runtime; it requires Ruby "
-                             ">= 3.4 and IMAGE_PACK_DISABLE_OFFLOAD must not be set");
-#endif
-    } else {
-        ip_context_set_error(ctx, IP_ERR_INVALID_ARGUMENT, "invalid resolved execution mode");
-    }
-
-    if (ctx->resolved_execution != IP_EXEC_DIRECT)
-        rb_thread_check_ints();
-
-    return ctx->status == IP_OK;
+    return ip_invoke(ctx, ip_run_optimize_nogvl);
 }
 
 static size_t config_size_value(VALUE config, ID id, size_t fallback, const char *name) {
@@ -2378,161 +2867,151 @@ static void validate_limits_for_pixels(ip_context_t *ctx) {
     ctx->decoded_bytes = decoded_bytes;
 }
 
-static VALUE ip_compress_jpeg_entry_body(VALUE ptr) {
-    ip_compress_jpeg_call_t *call = (ip_compress_jpeg_call_t *)ptr;
+static ip_context_t *ip_entry_alloc(ip_context_t **slot) {
     ip_context_t *ctx = ip_context_new();
     if (!ctx)
         rb_raise(rb_eImagePackOutOfMemoryError, "failed to allocate native context");
-    call->ctx = ctx;
+    *slot = ctx;
+    return ctx;
+}
 
-    ip_output_kind_t out_kind = ip_parse_output_kind(call->output_kind);
-    ctx->algo = ip_parse_algo(call->algo);
-    ctx->quality = NUM2INT(call->quality);
+static void ip_bind_runtime(ip_context_t *ctx, VALUE execution, VALUE cancellable,
+                            VALUE has_scheduler, VALUE strict) {
+    ctx->requested_execution = ip_parse_execution(execution);
+    ctx->cancellable_requested = ip_bool_value(cancellable);
+    ctx->has_scheduler = ip_bool_value(has_scheduler);
+    ctx->strict = ip_bool_value(strict);
+}
+
+static void ip_bind_encode_profile(ip_context_t *ctx, VALUE algo, VALUE quality, VALUE min_ssim,
+                                   VALUE trellis, VALUE scan_opt, VALUE progressive) {
+    ctx->algo = ip_parse_algo(algo);
+    ctx->quality = NUM2INT(quality);
     ctx->selected_quality = ctx->quality;
     ip_validate_quality_or_raise(ctx);
-    ctx->min_ssim = NUM2DBL(call->min_ssim);
+    ctx->min_ssim = NUM2DBL(min_ssim);
     ctx->ssim_guard_enabled = ctx->min_ssim > 0.0;
     ip_validate_min_ssim_or_raise(ctx);
-    ctx->mozjpeg_trellis_enabled = ip_bool_value(call->mozjpeg_trellis);
-    ctx->mozjpeg_scan_opt_enabled = ip_bool_value(call->mozjpeg_scan_opt);
-    ctx->progressive = ip_bool_value(call->progressive);
+    ctx->mozjpeg_trellis_enabled = ip_bool_value(trellis);
+    ctx->mozjpeg_scan_opt_enabled = ip_bool_value(scan_opt);
+    ctx->progressive = ip_bool_value(progressive);
+}
+
+static void ip_bind_encode_knobs(ip_context_t *ctx, VALUE subsampling, VALUE tune, VALUE effort) {
+    ctx->subsampling = NUM2INT(subsampling);
+    ctx->tune = NUM2INT(tune);
+    ctx->effort = NUM2INT(effort);
+}
+
+static int ip_bind_jpeg_io(ip_context_t *ctx, VALUE input, VALUE input_kind, VALUE output,
+                           ip_output_kind_t out_kind, int inspect_allow_cmyk) {
+    ip_input_kind_t in_kind = ip_parse_input_kind(input_kind);
+    if (!ip_prepare_output_path(ctx, output, out_kind) ||
+        !ip_prepare_input_bytes(ctx, input, in_kind))
+        return 0;
+    if (ctx->requested_execution == IP_EXEC_AUTO && ctx->input_size < ctx->direct_input_threshold &&
+        !ip_inspect_jpeg_header(ctx, inspect_allow_cmyk))
+        return 0;
+    ip_resolve_execution(ctx);
+    return ip_ensure_owned_input_for_async(ctx, input, in_kind);
+}
+
+static void ip_raise_prepare(ip_context_t *ctx, const char *message) {
+    ip_raise_for_status(ctx);
+    rb_raise(rb_eImagePackInvalidArgumentError, "%s", message);
+}
+
+static VALUE ip_complete_encode(ip_context_t *ctx, ip_output_kind_t kind, VALUE report) {
+    VALUE out = ip_finish_output(ctx, kind);
+    return ip_bool_value(report) ? ip_build_report(ctx, out) : out;
+}
+
+static VALUE ip_compress_jpeg_entry_body(VALUE ptr) {
+    ip_compress_jpeg_call_t *call = (ip_compress_jpeg_call_t *)ptr;
+    ip_context_t *ctx = ip_entry_alloc(&call->ctx);
+    ip_output_kind_t out_kind = ip_parse_output_kind(call->output_kind);
+
+    ip_bind_encode_profile(ctx, call->algo, call->quality, call->min_ssim, call->mozjpeg_trellis,
+                           call->mozjpeg_scan_opt, call->progressive);
     ctx->strip_metadata = ip_bool_value(call->strip_metadata);
-    ctx->requested_execution = ip_parse_execution(call->execution);
-    ctx->cancellable_requested = ip_bool_value(call->cancellable);
-    ctx->has_scheduler = ip_bool_value(call->has_scheduler);
-    ctx->strict = ip_bool_value(call->strict);
+    ctx->strip_icc = ip_bool_value(call->strip_icc);
+    ip_bind_encode_knobs(ctx, call->subsampling, call->tune, call->effort);
+    ctx->scale_num = (unsigned int)NUM2INT(call->scale_num);
+    ctx->scale_denom = (unsigned int)NUM2INT(call->scale_denom);
+    ip_bind_runtime(ctx, call->execution, call->cancellable, call->has_scheduler, call->strict);
     apply_configuration(call->self, ctx);
 
-    ip_input_kind_t in_kind = ip_parse_input_kind(call->input_kind);
-    if (!ip_prepare_output_path(ctx, call->output, out_kind) ||
-        !ip_prepare_input_bytes(ctx, call->input, in_kind)) {
-        ip_raise_for_status(ctx);
-        rb_raise(rb_eImagePackInvalidArgumentError, "invalid JPEG input");
-    }
-
-    if (ctx->requested_execution == IP_EXEC_AUTO && ctx->input_size < ctx->direct_input_threshold &&
-        !ip_inspect_jpeg_header(ctx, 0)) {
-        ip_raise_for_status(ctx);
-        rb_raise(rb_eImagePackInvalidImageError, "invalid JPEG input");
-    }
-
-    ip_resolve_execution(ctx);
-    if (!ip_ensure_owned_input_for_async(ctx, call->input, in_kind)) {
-        ip_raise_for_status(ctx);
-        rb_raise(rb_eImagePackInvalidArgumentError, "invalid JPEG input");
-    }
+    if (!ip_bind_jpeg_io(ctx, call->input, call->input_kind, call->output, out_kind, 0))
+        ip_raise_prepare(ctx, "invalid JPEG input");
 
     ip_run_context(ctx);
-    if (ip_bool_value(call->report)) {
-        VALUE output_value = ip_finish_output(ctx, out_kind);
-        return ip_build_report(ctx, output_value);
-    }
-    return ip_finish_output(ctx, out_kind);
+    return ip_complete_encode(ctx, out_kind, call->report);
 }
 
 static VALUE ip_compress_jpeg_entry(int argc, VALUE *argv, VALUE self) {
-    rb_check_arity(argc, 16, 16);
+    rb_check_arity(argc, 22, 22);
     ip_compress_jpeg_call_t call = {self,     argv[0],  argv[1],  argv[2],  argv[3],  argv[4],
                                     argv[5],  argv[6],  argv[7],  argv[8],  argv[9],  argv[10],
-                                    argv[11], argv[12], argv[13], argv[14], argv[15], NULL};
+                                    argv[11], argv[12], argv[13], argv[14], argv[15], argv[16],
+                                    argv[17], argv[18], argv[19], argv[20], argv[21], NULL};
     return rb_ensure(ip_compress_jpeg_entry_body, (VALUE)&call, ip_call_cleanup, (VALUE)&call.ctx);
 }
 
 static VALUE ip_compress_pixels_entry_body(VALUE ptr) {
     ip_compress_pixels_call_t *call = (ip_compress_pixels_call_t *)ptr;
-    ip_context_t *ctx = ip_context_new();
-    if (!ctx)
-        rb_raise(rb_eImagePackOutOfMemoryError, "failed to allocate native context");
-    call->ctx = ctx;
-
+    ip_context_t *ctx = ip_entry_alloc(&call->ctx);
     ip_output_kind_t out_kind = ip_parse_output_kind(call->output_kind);
-    ctx->algo = ip_parse_algo(call->algo);
-    ctx->quality = NUM2INT(call->quality);
-    ctx->selected_quality = ctx->quality;
-    ip_validate_quality_or_raise(ctx);
-    ctx->min_ssim = NUM2DBL(call->min_ssim);
-    ctx->ssim_guard_enabled = ctx->min_ssim > 0.0;
-    ip_validate_min_ssim_or_raise(ctx);
-    ctx->mozjpeg_trellis_enabled = ip_bool_value(call->mozjpeg_trellis);
-    ctx->mozjpeg_scan_opt_enabled = ip_bool_value(call->mozjpeg_scan_opt);
-    ctx->progressive = ip_bool_value(call->progressive);
+
+    ip_bind_encode_profile(ctx, call->algo, call->quality, call->min_ssim, call->mozjpeg_trellis,
+                           call->mozjpeg_scan_opt, call->progressive);
     ctx->strip_metadata = 1;
-    ctx->requested_execution = ip_parse_execution(call->execution);
-    ctx->cancellable_requested = ip_bool_value(call->cancellable);
-    ctx->has_scheduler = ip_bool_value(call->has_scheduler);
-    ctx->strict = ip_bool_value(call->strict);
+    ctx->strip_icc = 1;
+    ip_bind_encode_knobs(ctx, call->subsampling, call->tune, call->effort);
+    ip_bind_runtime(ctx, call->execution, call->cancellable, call->has_scheduler, call->strict);
     apply_configuration(call->self, ctx);
 
     if (!ip_prepare_output_path(ctx, call->output, out_kind) ||
         !ip_prepare_pixels(ctx, call->buffer, NUM2INT(call->width), NUM2INT(call->height),
-                           NUM2INT(call->channels), ip_bool_value(call->exact_size))) {
-        ip_raise_for_status(ctx);
-        rb_raise(rb_eImagePackInvalidArgumentError, "invalid pixel input");
-    }
+                           NUM2INT(call->channels), ip_bool_value(call->exact_size)))
+        ip_raise_prepare(ctx, "invalid pixel input");
 
     validate_limits_for_pixels(ctx);
     if (ctx->status != IP_OK)
         ip_raise_for_status(ctx);
 
     ip_resolve_execution(ctx);
-    if (!ip_ensure_owned_pixels_for_async(ctx, call->buffer)) {
-        ip_raise_for_status(ctx);
-        rb_raise(rb_eImagePackInvalidArgumentError, "invalid pixel input");
-    }
+    if (!ip_ensure_owned_pixels_for_async(ctx, call->buffer))
+        ip_raise_prepare(ctx, "invalid pixel input");
 
     ip_run_context(ctx);
-    if (ip_bool_value(call->report)) {
-        VALUE output_value = ip_finish_output(ctx, out_kind);
-        return ip_build_report(ctx, output_value);
-    }
-    return ip_finish_output(ctx, out_kind);
+    return ip_complete_encode(ctx, out_kind, call->report);
 }
 
 static VALUE ip_compress_pixels_entry(int argc, VALUE *argv, VALUE self) {
-    rb_check_arity(argc, 18, 18);
-    ip_compress_pixels_call_t call = {self,     argv[0],  argv[1],  argv[2],  argv[3],
-                                      argv[4],  argv[5],  argv[6],  argv[7],  argv[8],
-                                      argv[9],  argv[10], argv[11], argv[12], argv[13],
-                                      argv[14], argv[15], argv[16], argv[17], NULL};
+    rb_check_arity(argc, 21, 21);
+    ip_compress_pixels_call_t call = {self,     argv[0],  argv[1],  argv[2],  argv[3],  argv[4],
+                                      argv[5],  argv[6],  argv[7],  argv[8],  argv[9],  argv[10],
+                                      argv[11], argv[12], argv[13], argv[14], argv[15], argv[16],
+                                      argv[17], argv[18], argv[19], argv[20], NULL};
     return rb_ensure(ip_compress_pixels_entry_body, (VALUE)&call, ip_call_cleanup,
                      (VALUE)&call.ctx);
 }
 
 static VALUE ip_optimize_jpeg_entry_body(VALUE ptr) {
     ip_optimize_jpeg_call_t *call = (ip_optimize_jpeg_call_t *)ptr;
-    ip_context_t *ctx = ip_context_new();
-    if (!ctx)
-        rb_raise(rb_eImagePackOutOfMemoryError, "failed to allocate native context");
-    call->ctx = ctx;
-
+    ip_context_t *ctx = ip_entry_alloc(&call->ctx);
     ip_output_kind_t out_kind = ip_parse_output_kind(call->output_kind);
+
     ctx->progressive = ip_bool_value(call->progressive);
     ctx->strip_metadata = ip_bool_value(call->strip_metadata);
-    ctx->requested_execution = ip_parse_execution(call->execution);
-    ctx->cancellable_requested = ip_bool_value(call->cancellable);
-    ctx->has_scheduler = ip_bool_value(call->has_scheduler);
-    ctx->strict = ip_bool_value(call->strict);
+    ctx->strip_icc = ip_bool_value(call->strip_icc);
+    ctx->trim_partial_mcus = ip_bool_value(call->trim);
     ctx->ssim_guard_enabled = 0;
+    ip_bind_runtime(ctx, call->execution, call->cancellable, call->has_scheduler, call->strict);
     apply_configuration(call->self, ctx);
 
-    ip_input_kind_t in_kind = ip_parse_input_kind(call->input_kind);
-    if (!ip_prepare_output_path(ctx, call->output, out_kind) ||
-        !ip_prepare_input_bytes(ctx, call->input, in_kind)) {
-        ip_raise_for_status(ctx);
-        rb_raise(rb_eImagePackInvalidArgumentError, "invalid JPEG input");
-    }
-
-    if (ctx->requested_execution == IP_EXEC_AUTO && ctx->input_size < ctx->direct_input_threshold &&
-        !ip_inspect_jpeg_header(ctx, 1)) {
-        ip_raise_for_status(ctx);
-        rb_raise(rb_eImagePackInvalidImageError, "invalid JPEG input");
-    }
-
-    ip_resolve_execution(ctx);
-    if (!ip_ensure_owned_input_for_async(ctx, call->input, in_kind)) {
-        ip_raise_for_status(ctx);
-        rb_raise(rb_eImagePackInvalidArgumentError, "invalid JPEG input");
-    }
+    if (!ip_bind_jpeg_io(ctx, call->input, call->input_kind, call->output, out_kind, 1))
+        ip_raise_prepare(ctx, "invalid JPEG input");
 
     ip_run_optimize_context(ctx);
     return ip_finish_output(ctx, out_kind);
@@ -2541,10 +3020,10 @@ static VALUE ip_optimize_jpeg_entry_body(VALUE ptr) {
 static VALUE ip_optimize_jpeg_entry(VALUE self, VALUE input, VALUE input_kind, VALUE output,
                                     VALUE output_kind, VALUE progressive, VALUE strip_metadata,
                                     VALUE execution, VALUE cancellable, VALUE has_scheduler,
-                                    VALUE strict) {
-    ip_optimize_jpeg_call_t call = {self,        input,         input_kind,     output,
-                                    output_kind, progressive,   strip_metadata, execution,
-                                    cancellable, has_scheduler, strict,         NULL};
+                                    VALUE strict, VALUE strip_icc, VALUE trim) {
+    ip_optimize_jpeg_call_t call = {
+        self,      input,       input_kind,    output, output_kind, progressive, strip_metadata,
+        execution, cancellable, has_scheduler, strict, strip_icc,   trim,        NULL};
     return rb_ensure(ip_optimize_jpeg_entry_body, (VALUE)&call, ip_call_cleanup, (VALUE)&call.ctx);
 }
 
@@ -2611,7 +3090,7 @@ IMAGE_PACK_INIT_EXPORT void Init_image_pack(void) {
         int arity;
     } methods[] = {{"__compress_jpeg", (VALUE (*)(ANYARGS))ip_compress_jpeg_entry, -1},
                    {"__compress_pixels", (VALUE (*)(ANYARGS))ip_compress_pixels_entry, -1},
-                   {"__optimize_jpeg", (VALUE (*)(ANYARGS))ip_optimize_jpeg_entry, 10},
+                   {"__optimize_jpeg", (VALUE (*)(ANYARGS))ip_optimize_jpeg_entry, 12},
                    {"__inspect_image", (VALUE (*)(ANYARGS))ip_inspect_image_entry, 2}};
     for (size_t i = 0; i < IP_ARRAY_LEN(methods); i++) {
         rb_define_singleton_method(rb_mImagePack, methods[i].name, methods[i].fn, methods[i].arity);

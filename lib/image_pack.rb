@@ -31,8 +31,15 @@ module ImagePack
   ALGOS = %i[jpeg_turbo mozjpeg fast size].freeze
   ALGO_TO_NATIVE = { jpeg_turbo: :jpeg_turbo, mozjpeg: :mozjpeg, fast: :jpeg_turbo, size: :mozjpeg }.freeze
   EXECUTION_MODES = %i[direct nogvl offload auto].freeze
+  SUBSAMPLING_MODES = %i[auto 420 422 444].freeze
+  TUNE_MODES = %i[hvs ssim ms_ssim psnr].freeze
+  EFFORT_MODES = %i[default fast max].freeze
+  SUBSAMPLING_TO_NATIVE = { auto: 0, "420": 1, "422": 2, "444": 3 }.freeze
+  TUNE_TO_NATIVE = { hvs: 0, ssim: 1, ms_ssim: 2, psnr: 3 }.freeze
+  EFFORT_TO_NATIVE = { default: 0, fast: 1, max: 2 }.freeze
   DEFAULT_QUALITY = 82
   DEFAULT_ALGO = :mozjpeg
+  AUTO_444_QUALITY = 90
 
   class << self
     def configuration
@@ -57,6 +64,15 @@ module ImagePack
 
     def offload_safe?
       defined?(NATIVE_OFFLOAD_SAFE) && NATIVE_OFFLOAD_SAFE == true
+    end
+
+    def warn_if_scalar!
+      return if !defined?(NATIVE_SIMD) || NATIVE_SIMD
+      return if @scalar_warned
+
+      @scalar_warned = true
+      warn "ImagePack: this native build is scalar (no SIMD). On x86_64 install nasm " \
+           "and reinstall the gem for ~3-4x faster JPEG encode/decode."
     end
 
     def compress_bytes(bytes, **options)
@@ -89,11 +105,16 @@ module ImagePack
                       output: nil,
                       progressive: true,
                       strip_metadata: false,
+                      strip_icc: false,
+                      trim: false,
                       execution: nil,
                       cancellable: false,
                       strict: false)
+      warn_if_scalar!
       validate_boolean!(:progressive, progressive)
       validate_boolean!(:strip_metadata, strip_metadata)
+      validate_boolean!(:strip_icc, strip_icc)
+      validate_boolean!(:trim, trim)
       validate_boolean!(:cancellable, cancellable)
       validate_boolean!(:strict, strict)
       execution ||= configuration.execution
@@ -112,7 +133,9 @@ module ImagePack
                       execution,
                       cancellable ? 1 : 0,
                       has_scheduler ? 1 : 0,
-                      strict ? 1 : 0)
+                      strict ? 1 : 0,
+                      strip_icc ? 1 : 0,
+                      trim ? 1 : 0)
     end
 
     def compress(input,
@@ -121,23 +144,37 @@ module ImagePack
                  quality: nil,
                  min_ssim: nil,
                  mozjpeg_trellis: true,
-                 mozjpeg_scan_opt: true,
+                 mozjpeg_scan_opt: nil,
                  progressive: nil,
                  strip_metadata: true,
+                 strip_icc: false,
+                 subsampling: :auto,
+                 tune: :hvs,
+                 effort: :default,
+                 scale: 1,
                  execution: nil,
                  cancellable: false,
                  report: false,
                  strict: false)
+      warn_if_scalar!
       validate_algo!(algo)
       validate_min_ssim!(min_ssim)
       validate_boolean!(:mozjpeg_trellis, mozjpeg_trellis)
+      scan_opt_given = !mozjpeg_scan_opt.nil?
+      mozjpeg_scan_opt = true unless scan_opt_given
       validate_boolean!(:mozjpeg_scan_opt, mozjpeg_scan_opt)
       progressive = default_progressive_for(algo, progressive)
       validate_boolean!(:progressive, progressive)
       validate_boolean!(:strip_metadata, strip_metadata)
+      validate_boolean!(:strip_icc, strip_icc)
       validate_boolean!(:cancellable, cancellable)
       validate_boolean!(:report, report)
       validate_boolean!(:strict, strict)
+      subsampling = validate_subsampling!(subsampling)
+      tune = validate_tune!(tune)
+      effort = validate_effort!(effort)
+      scale_num, scale_denom = validate_scale!(scale)
+      mozjpeg_scan_opt = false if effort == :fast && !scan_opt_given
       quality_was_given = !quality.nil?
       effective_quality = quality_was_given ? quality : DEFAULT_QUALITY
       effective_quality = 1 if min_ssim && !quality_was_given
@@ -163,7 +200,12 @@ module ImagePack
                       has_scheduler ? 1 : 0,
                       report ? 1 : 0,
                       strict ? 1 : 0,
-                      mozjpeg_scan_opt ? 1 : 0)
+                      mozjpeg_scan_opt ? 1 : 0,
+                      strip_icc ? 1 : 0,
+                      SUBSAMPLING_TO_NATIVE.fetch(subsampling),
+                      TUNE_TO_NATIVE.fetch(tune),
+                      EFFORT_TO_NATIVE.fetch(effort),
+                      scale_num, scale_denom)
     end
 
     def compress_pixels(buffer,
@@ -175,18 +217,24 @@ module ImagePack
                         quality: nil,
                         min_ssim: nil,
                         mozjpeg_trellis: true,
-                        mozjpeg_scan_opt: true,
+                        mozjpeg_scan_opt: nil,
                         progressive: nil,
                         drop_alpha: nil,
                         exact_size: false,
+                        subsampling: :auto,
+                        tune: :hvs,
+                        effort: :default,
                         execution: nil,
                         cancellable: false,
                         report: false,
                         strict: false)
+      warn_if_scalar!
       validate_pixel_buffer!(buffer)
       validate_algo!(algo)
       validate_min_ssim!(min_ssim)
       validate_boolean!(:mozjpeg_trellis, mozjpeg_trellis)
+      scan_opt_given = !mozjpeg_scan_opt.nil?
+      mozjpeg_scan_opt = true unless scan_opt_given
       validate_boolean!(:mozjpeg_scan_opt, mozjpeg_scan_opt)
       progressive = default_progressive_for(algo, progressive)
       validate_boolean!(:progressive, progressive)
@@ -195,6 +243,10 @@ module ImagePack
       validate_boolean!(:cancellable, cancellable)
       validate_boolean!(:report, report)
       validate_boolean!(:strict, strict)
+      subsampling = validate_subsampling!(subsampling)
+      tune = validate_tune!(tune)
+      effort = validate_effort!(effort)
+      mozjpeg_scan_opt = false if effort == :fast && !scan_opt_given
       quality_was_given = !quality.nil?
       effective_quality = quality_was_given ? quality : DEFAULT_QUALITY
       effective_quality = 1 if min_ssim && !quality_was_given
@@ -237,10 +289,14 @@ module ImagePack
                         has_scheduler ? 1 : 0,
                         report ? 1 : 0,
                         strict ? 1 : 0,
-                        mozjpeg_scan_opt ? 1 : 0)
+                        mozjpeg_scan_opt ? 1 : 0,
+                        SUBSAMPLING_TO_NATIVE.fetch(subsampling),
+                        TUNE_TO_NATIVE.fetch(tune),
+                        EFFORT_TO_NATIVE.fetch(effort))
     end
 
     def inspect_image(input)
+      warn_if_scalar!
       __inspect_image(input, input_kind!(input))
     end
 
@@ -294,6 +350,64 @@ module ImagePack
       return if min_ssim.is_a?(Numeric) && min_ssim.positive? && min_ssim <= 1.0
 
       raise InvalidArgumentError, "min_ssim must be Numeric > 0.0 and <= 1.0, got: #{min_ssim.inspect}"
+    end
+
+    def validate_subsampling!(value)
+      value = value.to_s.to_sym if value.is_a?(Integer) || value.is_a?(String)
+      return value if SUBSAMPLING_MODES.include?(value)
+
+      raise InvalidArgumentError,
+            "subsampling must be one of #{SUBSAMPLING_MODES}, got: #{value.inspect}"
+    end
+
+    def validate_tune!(value)
+      return value if TUNE_MODES.include?(value)
+
+      raise InvalidArgumentError, "tune must be one of #{TUNE_MODES}, got: #{value.inspect}"
+    end
+
+    def validate_effort!(value)
+      return value if EFFORT_MODES.include?(value)
+
+      raise InvalidArgumentError, "effort must be one of #{EFFORT_MODES}, got: #{value.inspect}"
+    end
+
+    def validate_scale!(value)
+      num, denom =
+        case value
+        when Integer
+          raise InvalidArgumentError, "scale must be a positive fraction, got: #{value.inspect}" unless value.positive?
+
+          [value, 1]
+        when Float
+          if value == 1.0
+            [1, 1]
+          elsif value == 0.5
+            [1, 2]
+          elsif value == 0.25
+            [1, 4]
+          elsif value == 0.125
+            [1, 8]
+          else
+            raise InvalidArgumentError,
+                  "scale float must be 1.0, 0.5, 0.25, or 0.125, got: #{value.inspect}"
+          end
+        when Rational
+          [value.numerator, value.denominator]
+        when Array
+          raise InvalidArgumentError, "scale array must be [num, denom], got: #{value.inspect}" unless value.length == 2
+
+          value
+        else
+          raise InvalidArgumentError,
+                "scale must be 1, 0.5, 0.25, 0.125, Rational, or [num, denom], got: #{value.inspect}"
+        end
+
+      unless num.is_a?(Integer) && denom.is_a?(Integer) && num.positive? && denom.positive?
+        raise InvalidArgumentError, "scale numerator/denominator must be Integers > 0, got: #{value.inspect}"
+      end
+
+      [num, denom]
     end
 
     def validate_boolean!(name, value)
