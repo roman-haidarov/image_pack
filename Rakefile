@@ -47,7 +47,29 @@ namespace :simd do
   end
 end
 
+namespace :vendor do
+  desc "Verify that every patches/*.patch still applies to the vendored tree"
+  task :patches do
+    patch_dir = File.expand_path("patches", __dir__)
+    mozjpeg_dir = File.expand_path("ext/image_pack/vendor/mozjpeg", __dir__)
+    patches = Dir[File.join(patch_dir, "*.patch")].sort
+    if patches.empty?
+      puts "image_pack: no vendor patches"
+      next
+    end
+
+    abort "image_pack: vendored MozJPEG is missing at #{mozjpeg_dir}" unless Dir.exist?(mozjpeg_dir)
+
+    patches.each do |patch|
+      ok = system("patch", "-p1", "--dry-run", "--forward", "--batch", "-d", mozjpeg_dir, "-i", patch,
+                  out: File::NULL, err: File::NULL)
+      abort "image_pack: vendor patch does not apply: #{patch}" unless ok
+      puts "image_pack: vendor patch ok #{File.basename(patch)}"
+    end
+  end
+end
+
 namespace :release do
   desc "Run release checks"
-  task check: ["simd:check", :test]
+  task check: ["vendor:patches", "simd:check", :test]
 end

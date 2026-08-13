@@ -14,6 +14,7 @@ require "tmpdir"
 require_relative "../ext/image_pack/mozjpeg_sources"
 
 VENDOR_DIR = File.expand_path("../ext/image_pack/vendor", __dir__)
+PATCH_DIR = File.expand_path("../patches", __dir__)
 
 MOZJPEG = {
   version: ImagePackMozjpegSources::VERSION,
@@ -91,9 +92,24 @@ def vendor_mozjpeg!(tmpdir)
   download(url, tarball)
   verify_checksum!(tarball, :mozjpeg, MOZJPEG[:sha256])
   extract_mozjpeg(tarball, dest, strip_prefix: strip)
+  apply_vendor_patches!(dest)
 
   puts "  -> #{dest}"
   puts
+end
+
+def apply_vendor_patches!(mozjpeg_dir)
+  patches = Dir[File.join(PATCH_DIR, "*.patch")].sort
+  if patches.empty?
+    puts "  No vendor patches in #{PATCH_DIR}"
+    return
+  end
+
+  patches.each do |patch|
+    puts "  Applying #{File.basename(patch)}..."
+    ok = system("patch", "-p1", "--forward", "--batch", "-d", mozjpeg_dir, "-i", patch)
+    abort "failed to apply vendor patch #{patch}" unless ok
+  end
 end
 
 puts "Vendoring C libraries into #{VENDOR_DIR}"

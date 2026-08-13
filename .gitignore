@@ -56,3 +56,4 @@ profile_hot_paths.rb
 
 # samples
 samples/results/*
+benchmark/results/*

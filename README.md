@@ -55,6 +55,9 @@ ImagePack.compress_bytes(jpeg, min_ssim: 0.985)
 ImagePack.compress_bytes(jpeg, progressive: false) # force baseline output
 ImagePack.compress_bytes(jpeg, strict: true)
 ImagePack.compress_bytes(jpeg, report: true)
+ImagePack.compress_bytes(jpeg, subsampling: 444)
+ImagePack.compress_bytes(jpeg, scale: 0.5) # decode-time 1/2, 1/4, or 1/8
+ImagePack.compress_bytes(jpeg, tune: :hvs, effort: :max)
 ```
 
 
@@ -62,7 +65,13 @@ ImagePack.compress_bytes(jpeg, report: true)
 
 `algo: :fast` / `:jpeg_turbo` keeps baseline output by default and remains the throughput path.
 
-`min_ssim:` searches for the lowest acceptable quality using a fast native luma SSIM guard.
+`min_ssim:` searches for the lowest acceptable quality using a fast native luma SSIM guard. The metric is luma-only; with `subsampling: :auto` (the default) a failed guard retries 4:4:4 before raising `QualityConstraintError`. Pass `subsampling: 420`, `422`, or `444` (or the symbols `:auto`, `:"420"`, `:"422"`, `:"444"`) to force chroma sampling. For `algo: :size` / `:mozjpeg`, `:auto` uses 4:4:4 at `quality >= 90` and 4:2:0 otherwise. `algo: :fast` / `:jpeg_turbo` keeps 4:2:0 unless you set `subsampling:` explicitly.
+
+`strip_metadata: true` (the compress default) still keeps the ICC profile. Pass `strip_icc: true` to drop it. Existing JPEG→JPEG compress uses a planar YCbCr path when sampling can be preserved, so chroma is not upsampled and downsampled again.
+
+`tune:` is one of `:hvs` (default), `:ssim`, `:ms_ssim`, `:psnr` — the cjpeg-style MozJPEG presets. `effort:` is `:default`, `:fast` (skips scan search unless `mozjpeg_scan_opt:` is passed), or `:max` (extra trellis loops + quant-table opt).
+
+`scale:` is decode-time only (`1`, `0.5`, `0.25`, `0.125`, a Rational, or `[num, denom]`).
 
 `strict: true` raises `ImagePack::InvalidImageError` on damaged/truncated JPEG warnings.
 
@@ -90,11 +99,11 @@ ImagePack.optimize_bytes(jpeg)
 ImagePack.optimize_file("photo.jpg", output: "photo.optimized.jpg")
 ```
 
-This rewrites JPEG coefficients without decoding and re-encoding pixels. It is the right path for existing JPEGs when you only want optimized Huffman tables and optional progressive scans.
+This rewrites JPEG coefficients without decoding and re-encoding pixels. It is the right path for existing JPEGs when you only want optimized Huffman tables and optional progressive scans. `progressive: true` (the default) runs MozJPEG scan optimization (the jpegrescan-style search). Pass `progressive: false` for a baseline Huffman rewrite; that flag is applied explicitly and does not inherit the max-compression scan search.
 
 Defaults: `progressive: true`, `strip_metadata: false`.
 
-If `strip_metadata: true` would remove EXIF Orientation, `optimize_jpeg` raises `UnsupportedError` instead of silently changing visual orientation.
+If `strip_metadata: true` would remove EXIF Orientation, `optimize_jpeg` applies a lossless coefficient rotate/flip when the image is MCU-aligned. If a rotate/flip would crop partial MCU edges, it raises `UnsupportedError` instead of trimming. Pass `trim: true` to allow jpegtran-style cropping. ICC is kept unless `strip_icc: true`.
 
 ## Raw pixels
 
@@ -186,6 +195,7 @@ bundle exec rake release:check
 - JPEG only.
 - Ruby `>= 2.7.1`; `execution: :offload` requires Ruby `>= 3.4`. On Ruby 2.7–3.3, `:auto` uses `:direct` or `:nogvl`; it never attempts scheduler offload.
 - Pixel-level `compress` rejects CMYK/YCCK JPEG input; use `optimize_jpeg` for existing CMYK/YCCK JPEGs.
+- `min_ssim` is luma-only. Color artifacts from 4:2:0 are not scored; use `subsampling:` or rely on the auto 4:4:4 retry (size profile).
 - Arithmetic-coded JPEG support is disabled in `0.2.5`.
 - Streaming output is not supported; file output uses atomic write-through-temp-file and rename.
 - `ImagePack.compress(input, ...)` keeps a legacy path-vs-bytes heuristic; prefer explicit `*_bytes` / `*_file` helpers.

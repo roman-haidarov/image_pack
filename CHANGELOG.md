@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.7
+
+**Correctness**
+
+- `optimize_jpeg(progressive: false)` now explicitly disables `JBOOLEAN_OPTIMIZE_SCANS`. The previous path cleared `scan_info` but left mozjpeg's max-compression scan search enabled, which ran `memcpy(NULL, 0)` in `select_scans`.
+- `optimize_jpeg(progressive: true)` now enables scan optimization explicitly instead of inheriting it from `jpeg_set_defaults`.
+- Marker bombs are rejected before `jpeg_read_header` (and again when copying markers). The budget only counts marker types that will actually be saved for the current `strip_metadata` / `strip_icc` flags. APP1/APP2 profile chains allow up to 256 segments; other saved markers stay capped at 64. Combined payload stays at 8 MiB.
+- Default `compress` (`strip_metadata: true`) keeps the ICC profile. Pass `strip_icc: true` to drop it.
+- `mozjpeg_trellis: false` no longer disables overshoot deringing.
+
+**API**
+
+- `subsampling: :auto/:420/:422/:444` on `compress` / `compress_pixels`. For `algo: :size` / `:mozjpeg`, `:auto` uses 4:4:4 at quality >= 90, otherwise 4:2:0. `algo: :fast` / `:jpeg_turbo` keeps 4:2:0 unless `subsampling:` is set. The luma `min_ssim` guard still retries 4:4:4 before raising `QualityConstraintError`.
+- `tune: :hvs/:ssim/:ms_ssim/:psnr` and `effort: :default/:fast/:max`.
+- `scale:` decode-time downscale (`1`, `0.5`, `0.25`, `0.125`, Rational, or `[num, denom]`).
+- `strip_icc:` on `compress` and `optimize_jpeg`.
+- JPEG→JPEG `compress` uses a raw YCbCr path when chroma sampling can be preserved.
+- `optimize_jpeg(strip_metadata: true)` losslessly applies EXIF Orientation via `transupp` when the transform is MCU-perfect. Otherwise it raises `UnsupportedError` instead of silently cropping. Pass `trim: true` to opt in to jpegtran-style edge trim.
+
+**Distribution**
+
+- `rake vendor` applies `patches/*.patch` after unpacking MozJPEG; `rake release:check` dry-runs them.
+- Unused SIMD trees (`i386`, `mips`, `mips64`, `powerpc`, `aarch32`) are no longer packaged.
+- Scalar builds emit a one-time runtime warning instead of failing install.
+
 ## 0.2.6
 
 - Lowered the supported Ruby floor to `>= 2.7.1`. The core JPEG API, vendored MozJPEG build, `:direct`, and `:nogvl` execution modes work on Ruby 2.7.1.

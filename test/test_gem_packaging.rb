@@ -52,6 +52,28 @@ class TestGemPackaging < Minitest::Test
     end
   end
 
+  def test_gem_packages_x86_64_asm_sources
+    spec = gemspec
+
+    ImagePackMozjpegSources::X86_64_ASM_SOURCES.each do |relative_path|
+      path = File.join(MOZJPEG_DIR, relative_path)
+      assert File.file?(File.join(ROOT, path)), "missing vendored #{path}"
+      assert_includes spec.files, path, "#{path} must be packaged so x86_64 builds can enable SIMD"
+    end
+  end
+
+  def test_gem_does_not_package_unused_simd_architectures
+    spec = gemspec
+    unused = spec.files.select do |path|
+      path.include?("/simd/i386/") ||
+        path.include?("/simd/mips/") ||
+        path.include?("/simd/mips64/") ||
+        path.include?("/simd/powerpc/") ||
+        path.include?("/aarch32/")
+    end
+    assert_empty unused, "unused SIMD trees must not be packaged: #{unused.first(5).inspect}"
+  end
+
   def test_gem_does_not_package_known_mozjpeg_cli_or_test_sources
     spec = gemspec
 
